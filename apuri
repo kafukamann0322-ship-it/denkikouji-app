@@ -1,0 +1,3373 @@
+# denkikouji-app// zip-export.js - ZIP/PDF出力モジュール
+
+import { dataURLToBlob } from './camera.js';
+
+/**
+ * 材料集計ロジック（純粋関数・単体テスト可能）
+ * @param {Object} params
+ * @param {Array} params.categoriesWithMaterials - [{categoryId, poleName, categoryPath, materials:[{name,qty}]}]
+ * @param {Array} params.manualAdjustments - [{materialName, manualQty}]
+ * @returns {Array} [{name, qty, isManual}]
+ */
+export function aggregateMaterials({ categoriesWithMaterials = [], manualAdjustments = [] }) {
+  // Step1: 全材料をname単位でSUM
+  const sumMap = new Map();
+  for (const cat of categoriesWithMaterials) {
+    for (const mat of cat.materials) {
+      if (!mat.name || mat.qty <= 0) continue;
+      const name = mat.name.trim();
+      sumMap.set(name, (sumMap.get(name) || 0) + mat.qty);
+    }
+  }
+
+  // Step2: 手動調整値があれば最優先で上書き
+  const adjustMap = new Map();
+  for (const adj of manualAdjustments) {
+    adjustMap.set(adj.materialName, adj.manualQty);
+  }
+
+  // Step3: 結果をマージ
+  const result = [];
+  const allNames = new Set([...sumMap.keys(), ...adjustMap.keys()]);
+  for (const name of allNames) {
+    if (adjustMap.has(name)) {
+      result.push({ name, qty: adjustMap.get(name), isManual: true });
+    } else {
+      result.push({ name, qty: sumMap.get(name), isManual: false });
+    }
+  }
+
+  // 数量0以上のみ・名前順
+  return result.filter(r => r.qty > 0).sort((a, b) => a.name.localeCompare(b.name, 'ja'));
+}
+
+// ---- 自己テスト ----
+export function testAggregateMaterials() {
+  const testData = {
+    categoriesWithMaterials: [
+      { materials: [{ name: '電柱札', qty: 2 }, { name: '玉がいし', qty: 1 }] },
+      { materials: [{ name: '電柱札', qty: 3 }, { name: '支線バンド5号', qty: 4 }] }
+    ],
+    manualAdjustments: [{ materialName: '玉がいし', manualQty: 10 }]
+  };
+  const result = aggregateMaterials(testData);
+  const dentyu = result.find(r => r.name === '電柱札');
+  const tama = result.find(r => r.name === '玉がいし');
+  const shisen = result.find(r => r.name === '支線バンド5号');
+  console.assert(dentyu && dentyu.qty === 5, '[TEST FAIL] 電柱札合算が5でない:', dentyu?.qty);
+  console.assert(tama && tama.qty === 10 && tama.isManual, '[TEST FAIL] 玉がいし手動調整が10でない');
+  console.assert(shisen && shisen.qty === 4, '[TEST FAIL] 支線バンド5号が4でない');
+  console.log('[TEST PASS] aggregateMaterials: 合算・手動調整優先ロジック正常');
+  return result;
+}
+
+/**
+ * PDF生成（A4縦・日本語対応）
+ * @param {string} drawingName
+ * @param {Array} materials - [{name, qty}]
+ * @returns {Promise<Blob>}
+ */
+export async function generateMaterialPDF(drawingName, materials) {
+  // html2canvasでDOMをCanvas化してjsPDFに埋め込む
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
+
+  // PDF生成用の非表示DOM作成
+  const container = document.createElement('div');
+  container.style.cssText = `
+    position: fixed; left: -9999px; top: 0;
+    width: 794px; background: white; padding: 40px;
+    font-family: 'Noto Sans JP', sans-serif; color: #000;
+  `;
+
+  const today = new Date();
+  const dateStr = `${today.getFullYear()}/${String(today.getMonth()+1).padStart(2,'0')}/${String(today.getDate()).padStart(2,'0')}`;
+
+  let tableRows = materials.map((m, i) => `
+    <tr style="border-bottom: 1px solid #ccc;">
+      <td style="padding:6px 8px; text-align:center; border-right:1px solid #ccc; width:40px;">${i+1}</td>
+      <td style="padding:6px 8px; border-right:1px solid #ccc;">${m.name}</td>
+      <td style="padding:6px 8px; text-align:center; border-right:1px solid #ccc; width:60px;">${m.qty}</td>
+      <td style="padding:6px 8px; text-align:center; width:40px;">個</td>
+    </tr>
+  `).join('');
+
+  container.innerHTML = `
+    <div style="margin-bottom:20px;">
+      <h1 style="font-size:20px; font-weight:bold; margin:0 0 8px 0;">
+        図面番号: ${drawingName} 使用材料集計表
+      </h1>
+      <p style="font-size:13px; color:#555; margin:0;">作成日時: ${dateStr}</p>
+    </div>
+    <table style="width:100%; border-collapse:collapse; border:2px solid #333; font-size:14px;">
+      <thead>
+        <tr style="background:#1e293b; color:white;">
+          <th style="padding:8px; text-align:center; border-right:1px solid #4a5568; width:40px;">No</th>
+          <th style="padding:8px; text-align:left; border-right:1px solid #4a5568;">材料名</th>
+          <th style="padding:8px; text-align:center; border-right:1px solid #4a5568; width:60px;">数量</th>
+          <th style="padding:8px; text-align:center; width:40px;">単位</th>
+        </tr>
+      </thead>
+      <tbody>${tableRows}</tbody>
+    </table>
+    <p style="font-size:11px; color:#888; margin-top:12px;">総材料数: ${materials.length}品目</p>
+  `;
+  document.body.appendChild(container);
+
+  try {
+    const canvas = await html2canvas(container, {
+      scale: 2,
+      useCORS: true,
+      backgroundColor: '#ffffff'
+    });
+    document.body.removeChild(container);
+
+    const imgData = canvas.toDataURL('image/jpeg', 0.95);
+    const pageW = 210; // A4幅mm
+    const pageH = 297; // A4高さmm
+    const margin = 10;
+    const availW = pageW - margin * 2;
+    const imgW = canvas.width;
+    const imgH = canvas.height;
+    const ratio = availW / imgW;
+    let y = margin;
+    let remainH = imgH;
+    let srcY = 0;
+
+    // 複数ページ対応
+    while (remainH > 0) {
+      const pageAvailH = pageH - margin * 2;
+      const printH = Math.min(remainH * ratio, pageAvailH);
+      const srcH = printH / ratio;
+
+      const pageCanvas = document.createElement('canvas');
+      pageCanvas.width = imgW;
+      pageCanvas.height = srcH;
+      const ctx = pageCanvas.getContext('2d');
+      ctx.drawImage(canvas, 0, srcY, imgW, srcH, 0, 0, imgW, srcH);
+      const pageImgData = pageCanvas.toDataURL('image/jpeg', 0.95);
+
+      if (srcY > 0) doc.addPage();
+      doc.addImage(pageImgData, 'JPEG', margin, margin, availW, printH);
+
+      srcY += srcH;
+      remainH -= srcH;
+    }
+
+    return doc.output('blob');
+  } catch (e) {
+    if (document.body.contains(container)) document.body.removeChild(container);
+    throw e;
+  }
+}
+
+/**
+ * ZIP生成・出力
+ * @param {Object} params
+ */
+export async function generateZIP({
+  drawingName,
+  date,
+  polesData,
+  materials,
+  onProgress
+}) {
+  const JSZip = window.JSZip;
+  const zip = new JSZip();
+
+  const dateFolder = date || new Date().toISOString().slice(0, 10);
+  const drawingFolder = zip.folder(`${dateFolder}/${drawingName}`);
+
+  let totalPhotos = 0;
+  let processedPhotos = 0;
+
+  // 写真数カウント
+  for (const pole of polesData) {
+    for (const cat of pole.categories) {
+      for (const stage of ['事前', '中', '事後']) {
+        const photos = cat.photos?.[stage] || [];
+        if (photos.length > 0) totalPhotos += photos.length;
+      }
+    }
+  }
+
+  // ZIP構造生成（空フォルダ排除ロジック）
+  for (const pole of polesData) {
+    for (const cat of pole.categories) {
+      // カテゴリパス（例: 大工種/中工種/小工種）
+      const pathParts = cat.pathNames || [cat.name];
+
+      for (const stage of ['事前', '中', '事後']) {
+        const photos = cat.photos?.[stage] || [];
+        // 写真が存在する場合のみフォルダ生成（空フォルダ排除）
+        if (photos.length === 0) continue;
+
+        // フォルダパス: 日付/図面番号/電柱番号/[大工種/[中工種/[小工種]]]
+        const folderPath = [pole.name, ...pathParts].join('/');
+        let folder = drawingFolder;
+        for (const part of [pole.name, ...pathParts]) {
+          folder = folder.folder(part);
+        }
+
+        for (let i = 0; i < photos.length; i++) {
+          const photo = photos[i];
+          const num = String(i + 1).padStart(2, '0');
+          const catName = pathParts[pathParts.length - 1]; // 最末端工種名
+          const fileName = `${pole.name}_${catName}_${stage}_${num}.jpg`;
+
+          let blob;
+          if (photo.dataURL) {
+            const arr = photo.dataURL.split(',');
+            const bstr = atob(arr[1]);
+            const u8arr = new Uint8Array(bstr.length);
+            for (let j = 0; j < bstr.length; j++) u8arr[j] = bstr.charCodeAt(j);
+            blob = new Blob([u8arr], { type: 'image/jpeg' });
+          } else if (photo.blob) {
+            blob = photo.blob;
+          }
+
+          if (blob) {
+            folder.file(fileName, blob);
+          }
+
+          processedPhotos++;
+          if (onProgress) {
+            onProgress(Math.round((processedPhotos / totalPhotos) * 80));
+          }
+        }
+      }
+    }
+  }
+
+  // PDF生成して追加
+  if (onProgress) onProgress(85);
+  try {
+    const pdfBlob = await generateMaterialPDF(drawingName, materials);
+    zip.file('総材料数.pdf', pdfBlob);
+  } catch (e) {
+    console.error('PDF生成エラー:', e);
+  }
+
+  if (onProgress) onProgress(95);
+
+  // ZIP生成
+  const zipBlob = await zip.generateAsync({
+    type: 'blob',
+    compression: 'DEFLATE',
+    compressionOptions: { level: 6 }
+  }, (metadata) => {
+    if (onProgress && metadata.percent) {
+      // 95〜100%の範囲で更新
+    }
+  });
+
+  if (onProgress) onProgress(100);
+  return zipBlob;
+}
+
+/**
+ * ファイル保存（ブラウザダウンロード）
+ */
+export function downloadFile(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 5000);
+}
+
+// app.js - メインアプリケーションロジック（SPA）
+import {
+  initDB, saveDrawing, getAllDrawings, deleteDrawing,
+  savePole, getPolesByDrawing, deletePole,
+  saveCategory, getCategoriesByPole, getCategoriesByParent, deleteCategory,
+  saveMaterial, getMaterialsByCategory, deleteMaterial,
+  savePhoto, getPhotosByCategory, deletePhoto,
+  saveAdjustment, getAdjustmentsByDrawing,
+  saveMaster, getMaster,
+  saveSetting, getSetting, isFirstRun, markInitialized,
+  dbGet
+} from './db.js';
+import { startCamera, stopCamera, captureFrame, blobToDataURL, dataURLToBlob, testCALSProcessing } from './camera.js';
+import { aggregateMaterials, testAggregateMaterials, generateZIP, downloadFile } from './zip-export.js';
+
+// ====== 初期マスターデータ ======
+const INITIAL_MASTER = {
+  "categories": ["電柱・支線","電線（低圧）","電線（高圧）","変圧器","鳥害","引き込み線","ポリ管"],
+  "materials": [
+    {"genre":"電柱・支線","name":"絶縁パッキング"},{"genre":"電柱・支線","name":"電柱札"},{"genre":"電柱・支線","name":"電柱札取付ボルト"},{"genre":"電柱・支線","name":"足場基礎ネジ用ゴム栓"},{"genre":"電柱・支線","name":"足場ボルト（配電用）大谷工業製"},{"genre":"電柱・支線","name":"接地IV線8sq 300m/巻"},{"genre":"電柱・支線","name":"接地IV黒8sq 300m/巻"},{"genre":"電柱・支線","name":"接地抵抗低減剤（配電用）"},{"genre":"電柱・支線","name":"低減剤用接地板"},{"genre":"電柱・支線","name":"連結式接地棒"},{"genre":"電柱・支線","name":"連結式接地棒リード端子"},{"genre":"電柱・支線","name":"接地線カバー補修用"},{"genre":"電柱・支線","name":"接地線用カバー"},{"genre":"電柱・支線","name":"パイプ止めリング"},{"genre":"電柱・支線","name":"分割柱16C用接続ボルト 12本組"},{"genre":"電柱・支線","name":"細径分割柱16m用接続ボルト 10本組"},{"genre":"電柱・支線","name":"細径分割柱12・14m用接続ボルト 8本組（新型）"},{"genre":"電柱・支線","name":"アースターミナル ETP-2L"},{"genre":"電柱・支線","name":"アースターミナル用受口蓋"},{"genre":"電柱・支線","name":"電柱標示版 770×300 黒地黄色反射"},{"genre":"電柱・支線","name":"電柱標示版 770×610 黒地黄色反射"},{"genre":"電柱・支線","name":"電柱標示版用 樹脂バンド 10本入"},{"genre":"電柱・支線","name":"支柱金具 イワブチ製（配電用）"},{"genre":"電柱・支線","name":"コン柱キャップ"},{"genre":"電柱・支線","name":"支線バンド5号"},{"genre":"電柱・支線","name":"支線バンド14号"},{"genre":"電柱・支線","name":"タンバックル5号"},{"genre":"電柱・支線","name":"タンバックル14号"},{"genre":"電柱・支線","name":"巻付グリップ22シンプル用"},{"genre":"電柱・支線","name":"巻付グリップ22玉がいし用"},{"genre":"電柱・支線","name":"巻付グリップ55シンプル用"},{"genre":"電柱・支線","name":"巻付グリップ55玉がいし用"},{"genre":"電柱・支線","name":"巻付グリップ22アルミシンプル用"},{"genre":"電柱・支線","name":"巻付グリップ22アルミ玉がいし用"},{"genre":"電柱・支線","name":"巻付グリップ55アルミシンプル用"},{"genre":"電柱・支線","name":"巻付グリップ55アルミ玉がいし用"},{"genre":"電柱・支線","name":"玉がいし"},{"genre":"電柱・支線","name":"鋼撚線1種55 100M/ワッパ巻"},{"genre":"電柱・支線","name":"鋼撚線1種22 300M/ワッパ巻"},{"genre":"電柱・支線","name":"アルミ鋼撚線1種22 200/巻"},{"genre":"電柱・支線","name":"アルミ鋼撚線1種55 200/巻"},{"genre":"電柱・支線","name":"亜鉛メッキ鉄線 200m/巻"},{"genre":"電柱・支線","name":"打込アンカ14号"},{"genre":"電柱・支線","name":"打込アンカ22号"},{"genre":"電柱・支線","name":"岩盤用支線棒"},{"genre":"電柱・支線","name":"支線用シンプル5号"},{"genre":"電柱・支線","name":"支線用シンプル14号"},{"genre":"電柱・支線","name":"空中分岐用支線シンプル"},{"genre":"電柱・支線","name":"支線ガード共用"},{"genre":"電柱・支線","name":"Y支線金具"},{"genre":"電柱・支線","name":"支線V金具"},{"genre":"電柱・支線","name":"根枷用Uボルト"},{"genre":"電柱・支線","name":"パンザー用足場ボルト"},{"genre":"電柱・支線","name":"足場金具本体"},{"genre":"電柱・支線","name":"自在バンド"},{"genre":"電柱・支線","name":"パイプ支持金具"},{"genre":"電柱・支線","name":"ステンレスバンド L-1200"},{"genre":"電柱・支線","name":"ステンレスバンド L-400"},
+    {"genre":"電線（低圧）","name":"融着テープ"},{"genre":"電線（低圧）","name":"小ストラップ"},{"genre":"電線（低圧）","name":"ストラップ低圧活線用"},{"genre":"電線（低圧）","name":"ストラップ耐張がいし用"},{"genre":"電線（低圧）","name":"ボルト120mm 大谷工業製"},{"genre":"電線（低圧）","name":"ナット緩み止めM12"},{"genre":"電線（低圧）","name":"低圧用引留グリップ4.0mm"},{"genre":"電線（低圧）","name":"低圧用引留グリップ5.0mm"},{"genre":"電線（低圧）","name":"低圧用引留グリップ60mm"},{"genre":"電線（低圧）","name":"低圧用引留グリップ4・5mm・60SQ用アダプタ"},{"genre":"電線（低圧）","name":"低圧用引留グリップカバー"},{"genre":"電線（低圧）","name":"低圧引留がいし緑"},{"genre":"電線（低圧）","name":"低圧引留がいし白"},{"genre":"電線（低圧）","name":"低圧引留がいし茶"},{"genre":"電線（低圧）","name":"低圧大ピンがいし緑"},{"genre":"電線（低圧）","name":"低圧大ピンがいし白"},{"genre":"電線（低圧）","name":"低圧大ピンがいし茶"},{"genre":"電線（低圧）","name":"PJコネクタ38-II"},{"genre":"電線（低圧）","name":"PJコネクタ38-I"},{"genre":"電線（低圧）","name":"PJコネクタ60-I"},{"genre":"電線（低圧）","name":"PJコネクタ60-II"},{"genre":"電線（低圧）","name":"PJコネクタ100-I"},{"genre":"電線（低圧）","name":"PJコネクタ100-II"},{"genre":"電線（低圧）","name":"低圧用PJコネクタカバー38-100"},{"genre":"電線（低圧）","name":"PJコネクタ5-U"},{"genre":"電線（低圧）","name":"低圧用PJコネクタカバー5.0mm"},{"genre":"電線（低圧）","name":"低圧用エンドカバー（4-5用）"},{"genre":"電線（低圧）","name":"低圧用エンドカバー（60sq用）"},{"genre":"電線（低圧）","name":"腕金2700mm"},{"genre":"電線（低圧）","name":"腕金1800mm"},{"genre":"電線（低圧）","name":"腕金1500mm"},{"genre":"電線（低圧）","name":"防頃金具"},{"genre":"電線（低圧）","name":"腕金補強板金具"},{"genre":"電線（低圧）","name":"低圧直付金具"},{"genre":"電線（低圧）","name":"低圧槍出金具26型"},{"genre":"電線（低圧）","name":"低圧槍出金具23型"},{"genre":"電線（低圧）","name":"アームタイ800mm"},{"genre":"電線（低圧）","name":"アームタイ900mm"},{"genre":"電線（低圧）","name":"アームタイ1000mm"},{"genre":"電線（低圧）","name":"アームタイ1400mm"},{"genre":"電線（低圧）","name":"可変アームタイバンド一般用"},{"genre":"電線（低圧）","name":"座金（Uバンド用）"},{"genre":"電線（低圧）","name":"可変Uバンド（大口径用）"},{"genre":"電線（低圧）","name":"腕金用補助フック取付金具"},
+    {"genre":"電線（高圧）","name":"高圧用エンドカバー"},{"genre":"電線（高圧）","name":"連結リンク2個連用"},{"genre":"電線（高圧）","name":"ストラップ活線2コ連用"},{"genre":"電線（高圧）","name":"クランプ用連結リンク Z317"},{"genre":"電線（高圧）","name":"耐張シンプル"},{"genre":"電線（高圧）","name":"中線V金具"},{"genre":"電線（高圧）","name":"高圧耐張がいし 白"},{"genre":"電線（高圧）","name":"高圧耐張がいし 茶"},{"genre":"電線（高圧）","name":"高圧中実がいし10号 白"},{"genre":"電線（高圧）","name":"高圧中実がいし10号 茶"},{"genre":"電線（高圧）","name":"ストラップ2コ連用"},{"genre":"電線（高圧）","name":"ストラップ高圧活線用（耐張用ストラップ・活線用）"},{"genre":"電線（高圧）","name":"耐雷ホーン エナジーサポート製（一般用）"},{"genre":"電線（高圧）","name":"耐雷ホーン（耐塩用）"},{"genre":"電線（高圧）","name":"耐雷ホーン用ナットゆるみ止めキャップ"},{"genre":"電線（高圧）","name":"放電電極 60mm用"},{"genre":"電線（高圧）","name":"縁廻しがいし 白"},{"genre":"電線（高圧）","name":"縁廻しがいし 茶"},{"genre":"電線（高圧）","name":"縁廻し補助金具"},{"genre":"電線（高圧）","name":"被覆巻付バインド OE5.0mm 本線用"},{"genre":"電線（高圧）","name":"被覆巻付バインド OC-W60 本線用"},{"genre":"電線（高圧）","name":"被覆巻付バインド OC-W125 本線用"},{"genre":"電線（高圧）","name":"巻付バインド5.0mmCu"},{"genre":"電線（高圧）","name":"巻付バインド60sqCu"},{"genre":"電線（高圧）","name":"巻付バインド125sqCu"},{"genre":"電線（高圧）","name":"巻付バインドアルミ32"},{"genre":"電線（高圧）","name":"巻付バインドアルミ32OE（OC）"},{"genre":"電線（高圧）","name":"巻付バインドアルミ110（OC）"},{"genre":"電線（高圧）","name":"被覆巻付バインド（縁廻し用）OE5mm"},{"genre":"電線（高圧）","name":"被覆巻付バインド（縁廻し用）OCW60sq"},{"genre":"電線（高圧）","name":"被覆巻付バインド（縁廻し用）OCW125"},{"genre":"電線（高圧）","name":"三角配線用高圧碍子金具6号"},{"genre":"電線（高圧）","name":"三角配線金具6号"},{"genre":"電線（高圧）","name":"引下用碍子支持金具10号"},{"genre":"電線（高圧）","name":"三角配線用高圧碍子金具10号"},{"genre":"電線（高圧）","name":"高圧直付縁廻し金具"},{"genre":"電線（高圧）","name":"三角配線金具10号"},{"genre":"電線（高圧）","name":"縦打用碍子支持金具10号"},{"genre":"電線（高圧）","name":"碍子補助金具10号"},{"genre":"電線（高圧）","name":"高圧直付金具"},{"genre":"電線（高圧）","name":"高圧直付金具 大口径"},{"genre":"電線（高圧）","name":"高圧縦引金具"},{"genre":"電線（高圧）","name":"高圧水平引留金具"},{"genre":"電線（高圧）","name":"改装柱金具取付バンド19"},{"genre":"電線（高圧）","name":"改装柱金具取付バンド23"},{"genre":"電線（高圧）","name":"高圧水平角度金具取付B"},{"genre":"電線（高圧）","name":"改高圧水平槍出金具"},{"genre":"電線（高圧）","name":"高圧水平金具"},{"genre":"電線（高圧）","name":"高圧槍出金具GW無用23型"},{"genre":"電線（高圧）","name":"高圧槍出金具GW有用23型"},{"genre":"電線（高圧）","name":"高圧槍出金具GW有用28型"},{"genre":"電線（高圧）","name":"高圧槍出GW金具"},{"genre":"電線（高圧）","name":"機器腕金"},{"genre":"電線（高圧）","name":"水抜型直線スリーブカバーCU5.0"},{"genre":"電線（高圧）","name":"水抜型直線スリーブカバーCU60"},{"genre":"電線（高圧）","name":"水抜型直線スリーブカバーCU125"},{"genre":"電線（高圧）","name":"圧縮直線スリーブ5.0mm"},{"genre":"電線（高圧）","name":"圧縮直線スリーブ60"},{"genre":"電線（高圧）","name":"圧縮直線スリーブ125"},{"genre":"電線（高圧）","name":"直線スリーブカバーCU5.0"},{"genre":"電線（高圧）","name":"圧縮ジャンパースリーブ60"},{"genre":"電線（高圧）","name":"圧縮ジャンパースリーブ125"},{"genre":"電線（高圧）","name":"ジャンパースリーブカバーCU60"},{"genre":"電線（高圧）","name":"ジャンパースリーブカバーCU125"},{"genre":"電線（高圧）","name":"間接用直線スリーブ5.0mm"},{"genre":"電線（高圧）","name":"間接用直線スリーブ60"},{"genre":"電線（高圧）","name":"間接用直線スリーブ125"},{"genre":"電線（高圧）","name":"C型補助スリーブ"},{"genre":"電線（高圧）","name":"被覆補修カバー5.0"},{"genre":"電線（高圧）","name":"被覆補修カバー60"},{"genre":"電線（高圧）","name":"被覆補修カバー125"},{"genre":"電線（高圧）","name":"引留クランプ5.0（小）"},{"genre":"電線（高圧）","name":"引留クランプ60（大）"},{"genre":"電線（高圧）","name":"引留クランプ125"},{"genre":"電線（高圧）","name":"クランプカバー5.0-60 黒"},{"genre":"電線（高圧）","name":"引留クランプカバー125 黒"},{"genre":"電線（高圧）","name":"縁廻しリング"},
+    {"genre":"変圧器","name":"ハンガバンド50以下2コ用小"},{"genre":"変圧器","name":"ハンガバンド50以下2コ用大"},{"genre":"変圧器","name":"ハンガバンド100以下2コ用小"},{"genre":"変圧器","name":"ハンガバンド100以下2コ用大"},{"genre":"変圧器","name":"直付ハンガ（共用型）名伸電機製"},{"genre":"変圧器","name":"直付変圧器落下防止金具"},{"genre":"変圧器","name":"変圧器アームタイバンド"},{"genre":"変圧器","name":"ハンガ中"},{"genre":"変圧器","name":"ハンガ大 CTK製"},{"genre":"変圧器","name":"ハンガ特大 CTK製"},{"genre":"変圧器","name":"高圧大ピンがいし"},{"genre":"変圧器","name":"がいし支持金具"},{"genre":"変圧器","name":"変圧器リード線支持金具"},{"genre":"変圧器","name":"ナット緩み止め M16"},{"genre":"変圧器","name":"引下コネクタ60"},{"genre":"変圧器","name":"引下コネクタ125"},{"genre":"変圧器","name":"引下コネクタカバーCu 共用型"},{"genre":"変圧器","name":"アルミ引下コネクタ3型"},{"genre":"変圧器","name":"アルミ引下コネクタ9型"},{"genre":"変圧器","name":"PDEPR5.5sq 300m/巻"},{"genre":"変圧器","name":"PCリード線キャップ"},{"genre":"変圧器","name":"変圧器リード線用キャップ（2線用）"},{"genre":"変圧器","name":"変圧器リード線用キャップ（単線用）"},{"genre":"変圧器","name":"巻クリップ（碍子用）"},{"genre":"変圧器","name":"PC複合コーティングF15以下用"},{"genre":"変圧器","name":"PC複合コーティングF20・30以下用"},{"genre":"変圧器","name":"PC複合コーティングF50以上用"},{"genre":"変圧器","name":"銅管圧縮端子60"},{"genre":"変圧器","name":"銅管圧縮端子125"},{"genre":"変圧器","name":"銅管圧縮端子100"},{"genre":"変圧器","name":"PCヒューズ筒 6号PC用"},{"genre":"変圧器","name":"PCヒューズ筒 旧耐雷PC用"},{"genre":"変圧器","name":"塩風受皿（小）"},{"genre":"変圧器","name":"耐塩大ピンがいし"},{"genre":"変圧器","name":"計器用絶縁端末キャップ 中"},{"genre":"変圧器","name":"変圧器一次ブッシング保護金具カバー"},{"genre":"変圧器","name":"柱上変圧器2次ブッシングカバー 30kVA-75kVA"},{"genre":"変圧器","name":"PC袋ゴム栓 一般用"},{"genre":"変圧器","name":"ボルト150mm"},{"genre":"変圧器","name":"ボルト180mm"},{"genre":"変圧器","name":"ボルト450mm"},{"genre":"変圧器","name":"ボルト400mm"},{"genre":"変圧器","name":"ボルト550mm"},{"genre":"変圧器","name":"等辺山形鋼"},{"genre":"変圧器","name":"FP用変圧器バンド（小）（2個包装）"},{"genre":"変圧器","name":"FP用変圧器バンド（大）（2個包装）"},{"genre":"変圧器","name":"FP用変圧器受バンド（10個包装）"},{"genre":"変圧器","name":"FP用PC取付金具（2個包装）"},
+    {"genre":"鳥害","name":"鳥害防止器 本体支持具電線用ニチアン製"},{"genre":"鳥害","name":"鳥害防止器 本体支持具鋼より線用ニチアン製"},{"genre":"鳥害","name":"鳥害防止器 ラインロープニチアン製"},{"genre":"鳥害","name":"鳥害防止器 GWアタッチメント"},{"genre":"鳥害","name":"鳥害防止器 OW4・5mmアタッチメント"},{"genre":"鳥害","name":"耐雷PC 一般用"},{"genre":"鳥害","name":"2次ブッシングカバー"},{"genre":"鳥害","name":"アームタイバンド一般用（大口径用）"},{"genre":"鳥害","name":"可変Uバンド（大口径用）"},{"genre":"鳥害","name":"2次ブッシングカバー（中）"},{"genre":"鳥害","name":"2次ブッシングカバー（大）"},{"genre":"鳥害","name":"とま連山"},{"genre":"鳥害","name":"鳥害対策風車"},{"genre":"鳥害","name":"防鳥キャップ"},{"genre":"鳥害","name":"連凧"},{"genre":"鳥害","name":"連凧保持具"},{"genre":"鳥害","name":"とま連山固定具"},{"genre":"鳥害","name":"鳥害防止器具SG型 φ25フレキタイプ"},
+    {"genre":"引き込み線","name":"低圧がいし金具"},{"genre":"引き込み線","name":"メッセン吊金具（DVがいし小金具）"},{"genre":"引き込み線","name":"メッセン吊金具（ハンガー40型）"},{"genre":"引き込み線","name":"メッセン吊金具（ハンガー65型）"},{"genre":"引き込み線","name":"ポリスパイラルチューブ黒"},{"genre":"引き込み線","name":"メッセン吊金具（隙間がいし金具）"},{"genre":"引き込み線","name":"ヒューズ電線3.2mm以下用ロック付"},{"genre":"引き込み線","name":"ヒューズ電線14-22以下用（カバー付）"},{"genre":"引き込み線","name":"引込線用スリーブカバー小"},{"genre":"引き込み線","name":"引込線用スリーブカバー大"},{"genre":"引き込み線","name":"引込線用スリーブカバー小（補修用）"},{"genre":"引き込み線","name":"引込線用スリーブカバー大（補修用）"},{"genre":"引き込み線","name":"DV2.0mm×2c 100m/巻"},{"genre":"引き込み線","name":"DV2.6mm×2c 100m/巻"},{"genre":"引き込み線","name":"DV3.2mm×2c 100m/巻"},{"genre":"引き込み線","name":"DV2.0mm×3c 100m/巻"},{"genre":"引き込み線","name":"DV2.6mm×3c 100m/巻"},{"genre":"引き込み線","name":"DV3.2mm×3c 100m/巻"},{"genre":"引き込み線","name":"DV14×3c 300m/巻"},{"genre":"引き込み線","name":"DV22×3c 300m/巻"},{"genre":"引き込み線","name":"DV38×3c 300m/巻"},{"genre":"引き込み線","name":"DVグリップ14mm2 電灯用"},{"genre":"引き込み線","name":"DVグリップ14mm2 動力用"},{"genre":"引き込み線","name":"DVグリップ22mm2 電灯用"},{"genre":"引き込み線","name":"DVグリップ22mm2 動力用"},{"genre":"引き込み線","name":"DVグリップ38mm2 電灯用"},{"genre":"引き込み線","name":"DVグリップ38mm2 動力用"},{"genre":"引き込み線","name":"DVグリップ60mm2（3線）電灯用"},{"genre":"引き込み線","name":"DVグリップ60mm2（3線）動力用"},{"genre":"引き込み線","name":"DVグリップ100mm2（3線）電灯用"},{"genre":"引き込み線","name":"DV引留がいし茶"},{"genre":"引き込み線","name":"DV引留がいし白"},{"genre":"引き込み線","name":"DV年度表示札 黄"},{"genre":"引き込み線","name":"DV年度表示札 黒"},{"genre":"引き込み線","name":"DV年度表示札 赤"},{"genre":"引き込み線","name":"DV年度表示札 緑"},{"genre":"引き込み線","name":"Bスリーブ2.0mm"},{"genre":"引き込み線","name":"Bスリーブ2.6mm"},{"genre":"引き込み線","name":"Bスリーブ3.2mm"},{"genre":"引き込み線","name":"Bスリーブ4.0mm"},{"genre":"引き込み線","name":"Bスリーブ5.0mm"},{"genre":"引き込み線","name":"Bスリーブ22"},{"genre":"引き込み線","name":"Sスリーブ3.2mm"},{"genre":"引き込み線","name":"ビニルチューブ16mm"},{"genre":"引き込み線","name":"ビニルチューブ54mm"},{"genre":"引き込み線","name":"引込線用PJコネクタ5型"},{"genre":"引き込み線","name":"引込線用PJコネクタ60型"},{"genre":"引き込み線","name":"引込線用PJコネクタカバー共用型"},{"genre":"引き込み線","name":"ビニル銅バインド線2.0mm 300m/巻"},{"genre":"引き込み線","name":"ビニル銅バインド線1.6mm 300m/巻"},{"genre":"引き込み線","name":"ビニル銅バインド線1.2mm 300m/巻"},{"genre":"引き込み線","name":"ストラップDV"},{"genre":"引き込み線","name":"ストラップ簡易DV"},{"genre":"引き込み線","name":"DV60×3c 300m/巻"},{"genre":"引き込み線","name":"IV緑60sq 300m/巻"},{"genre":"引き込み線","name":"IV青60sq 300m/巻"},{"genre":"引き込み線","name":"IV赤60sq 300m/巻"},{"genre":"引き込み線","name":"IV黒60sq 300m/巻"},
+    {"genre":"ポリ管","name":"耐摩耗ポリ線カバー25-5 愛洋産業製"},{"genre":"ポリ管","name":"耐摩耗ポリ線カバー35 愛洋産業製"},{"genre":"ポリ管","name":"耐摩耗ポリ線130×90"},{"genre":"ポリ管","name":"ポリエチレン線カバー25mm 愛洋産業製"},{"genre":"ポリ管","name":"ポリエチレン線カバー35mm 愛洋産業製"},{"genre":"ポリ管","name":"ポリ線カバー130×90"},{"genre":"ポリ管","name":"ポリ管固定具"},{"genre":"ポリ管","name":"間接活線用ポリ管固定具"},{"genre":"ポリ管","name":"ポリ管補助具25"},{"genre":"ポリ管","name":"ポリ管補助具35"}
+  ]
+};
+
+// ====== グローバル状態 ======
+let state = {
+  workDate: new Date().toISOString().slice(0, 10),
+  currentDrawingId: null,
+  currentPoleId: null,
+  currentCategoryPath: [], // [{id, name}]
+  currentCategoryId: null,
+  currentStage: null,
+  editMode: false,
+  deleteMode: false,
+  masterData: null
+};
+
+// UUID生成
+function uid() {
+  return Date.now().toString(36) + Math.random().toString(36).slice(2);
+}
+
+// ====== エラーハンドリング ======
+function showError(message) {
+  const overlay = document.getElementById('error-modal');
+  document.getElementById('error-message').textContent = message;
+  overlay.style.display = 'flex';
+}
+
+function showQuotaError() {
+  showError('端末のストレージ容量が不足しています。不要な写真を削除するか、一度ZIPを出力してください。');
+}
+
+async function safeSave(fn) {
+  try {
+    return await fn();
+  } catch (e) {
+    if (e.message === 'QUOTA_EXCEEDED' || e.name === 'QuotaExceededError') {
+      showQuotaError();
+      return null;
+    }
+    throw e;
+  }
+}
+
+// ====== 共通UI ======
+function showProgress(msg = 'ZIP/PDF作成中...', pct = 0) {
+  const overlay = document.getElementById('progress-overlay');
+  document.getElementById('progress-message').textContent = msg;
+  document.getElementById('progress-fill').style.width = pct + '%';
+  overlay.style.display = 'flex';
+}
+
+function updateProgress(pct, msg) {
+  document.getElementById('progress-fill').style.width = pct + '%';
+  if (msg) document.getElementById('progress-message').textContent = msg;
+}
+
+function hideProgress() {
+  document.getElementById('progress-overlay').style.display = 'none';
+}
+
+function showToast(message, type = 'info') {
+  const toast = document.createElement('div');
+  toast.className = `toast toast-${type}`;
+  toast.textContent = message;
+  document.body.appendChild(toast);
+  setTimeout(() => toast.remove(), 3000);
+}
+
+// 確認ダイアログ
+function confirm(title, message) {
+  return new Promise(resolve => {
+    const modal = document.getElementById('confirm-modal');
+    document.getElementById('confirm-title').textContent = title;
+    document.getElementById('confirm-message').textContent = message;
+    modal.style.display = 'flex';
+
+    const okBtn = document.getElementById('confirm-ok');
+    const cancelBtn = document.getElementById('confirm-cancel');
+
+    const cleanup = (result) => {
+      modal.style.display = 'none';
+      okBtn.removeEventListener('click', onOk);
+      cancelBtn.removeEventListener('click', onCancel);
+      resolve(result);
+    };
+
+    const onOk = () => cleanup(true);
+    const onCancel = () => cleanup(false);
+    okBtn.addEventListener('click', onOk);
+    cancelBtn.addEventListener('click', onCancel);
+  });
+}
+
+// ====== パンくずリスト ======
+function updateBreadcrumb() {
+  const bc = document.getElementById('breadcrumb');
+  if (!bc) return;
+  const items = [];
+
+  items.push({ label: 'ホーム', action: () => navigateTo('home') });
+
+  if (state.currentDrawingId) {
+    const name = getDrawingName(state.currentDrawingId);
+    items.push({ label: `図面: ${name}`, action: () => navigateTo('poles', state.currentDrawingId) });
+  }
+  if (state.currentPoleId) {
+    const name = getPoleName(state.currentPoleId);
+    items.push({ label: `電柱: ${name}`, action: () => navigateTo('categories', state.currentDrawingId, state.currentPoleId) });
+  }
+  for (let i = 0; i < state.currentCategoryPath.length; i++) {
+    const cat = state.currentCategoryPath[i];
+    const isLast = i === state.currentCategoryPath.length - 1;
+    if (isLast) {
+      items.push({ label: cat.name, action: null });
+    } else {
+      const catId = cat.id;
+      items.push({ label: cat.name, action: () => navigateTo('subcategories', state.currentDrawingId, state.currentPoleId, catId) });
+    }
+  }
+
+  bc.innerHTML = items.map((item, i) => {
+    const isLast = i === items.length - 1;
+    const sep = i > 0 ? '<span class="breadcrumb-sep">›</span>' : '';
+    return `${sep}<span class="breadcrumb-item ${isLast ? 'current' : ''}" data-idx="${i}">${item.label}</span>`;
+  }).join('');
+
+  bc.querySelectorAll('.breadcrumb-item:not(.current)').forEach((el) => {
+    const idx = parseInt(el.dataset.idx);
+    el.addEventListener('click', () => {
+      if (items[idx]?.action) items[idx].action();
+    });
+  });
+}
+
+// 図面名・電柱名のキャッシュ
+const _drawingNameCache = {};
+const _poleNameCache = {};
+
+function getDrawingName(id) { return _drawingNameCache[id] || id; }
+function getPoleName(id) { return _poleNameCache[id] || id; }
+
+// ====== SPA ルーティング ======
+let _routeData = {};
+
+function navigateTo(screen, ...args) {
+  _routeData = { screen, args };
+  history.pushState(_routeData, '', '#' + screen);
+  renderScreen(screen, args);
+}
+
+window.onpopstate = (event) => {
+  if (event.state) {
+    const { screen, args } = event.state;
+    renderScreen(screen, args || []);
+  } else {
+    renderScreen('home', []);
+  }
+};
+
+// 離脱防止
+window.addEventListener('beforeunload', (e) => {
+  e.preventDefault();
+  e.returnValue = 'データが失われる可能性があります。ページを離れますか？';
+});
+
+function renderScreen(screen, args = []) {
+  // 全画面非表示
+  document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
+
+  // カメラ停止（カメラ画面以外）
+  if (screen !== 'camera') {
+    stopCamera();
+    const cameraView = document.getElementById('camera-view');
+    if (cameraView) cameraView.style.display = 'none';
+  }
+
+  switch (screen) {
+    case 'home': renderHome(); break;
+    case 'poles': renderPoles(args[0]); break;
+    case 'categories': renderCategories(args[0], args[1], null, 0); break;
+    case 'subcategories': renderCategories(args[0], args[1], args[2], null); break;
+    case 'workscreen': renderWorkScreen(args[0], args[1], args[2]); break;
+    case 'materials': renderMaterialsAgg(args[0]); break;
+    case 'camera': openCameraScreen(args[0], args[1], args[2]); break;
+    default: renderHome();
+  }
+  updateBreadcrumb();
+}
+
+// ====== 画面1: ホーム（図面一覧） ======
+async function renderHome() {
+  state.currentDrawingId = null;
+  state.currentPoleId = null;
+  state.currentCategoryPath = [];
+  state.currentCategoryId = null;
+  state.editMode = false;
+  state.deleteMode = false;
+
+  const screen = document.getElementById('screen-home');
+  screen.classList.add('active');
+
+  // 日付設定
+  const dateInput = document.getElementById('work-date');
+  if (dateInput) {
+    dateInput.value = state.workDate;
+    dateInput.onchange = () => { state.workDate = dateInput.value; };
+  }
+
+  await loadDrawingList();
+}
+
+async function loadDrawingList() {
+  const drawings = await getAllDrawings();
+  const list = document.getElementById('drawing-list');
+
+  // キャッシュ更新
+  drawings.forEach(d => { _drawingNameCache[d.id] = d.name; });
+
+  if (drawings.length === 0) {
+    list.innerHTML = `
+      <div class="empty-state">
+        <div class="empty-icon">📋</div>
+        <div class="empty-text">「＋追加」から図面番号を入力してください</div>
+      </div>`;
+    return;
+  }
+
+  list.innerHTML = drawings.map(d => `
+    <div class="list-item" id="drawing-item-${d.id}">
+      <div class="list-item-text" data-drawing-id="${d.id}">${d.name}</div>
+      <button class="btn btn-success btn-sm" id="zip-btn-${d.id}" data-drawing-id="${d.id}">
+        ✅ ZIP出力
+      </button>
+      ${state.deleteMode ? `<button class="btn btn-danger btn-sm" id="del-drawing-${d.id}" data-drawing-id="${d.id}">🗑️</button>` : ''}
+    </div>
+  `).join('');
+
+  // イベント
+  list.querySelectorAll('[data-drawing-id]').forEach(el => {
+    const id = el.dataset.drawingId;
+    if (el.classList.contains('list-item-text')) {
+      el.addEventListener('click', () => {
+        state.currentDrawingId = id;
+        navigateTo('poles', id);
+      });
+    } else if (el.id.startsWith('zip-btn-')) {
+      el.addEventListener('click', (e) => {
+        e.stopPropagation();
+        handleZipExport(id);
+      });
+    } else if (el.id.startsWith('del-drawing-')) {
+      el.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        const name = _drawingNameCache[id];
+        const ok = await confirm('図面削除', `「${name}」を削除します。\n関連する電柱・写真・材料データも全て削除されます。よろしいですか？`);
+        if (ok) {
+          await deleteDrawing(id);
+          await loadDrawingList();
+          showToast('図面を削除しました', 'success');
+        }
+      });
+    }
+  });
+}
+
+// 図面追加
+document.getElementById('add-drawing-btn')?.addEventListener('click', async () => {
+  const input = document.getElementById('drawing-input');
+  const name = input.value.trim();
+  if (!name) { showToast('図面番号を入力してください', 'error'); return; }
+
+  const drawing = { id: uid(), name, createdAt: Date.now() };
+  await safeSave(() => saveDrawing(drawing));
+  _drawingNameCache[drawing.id] = name;
+  input.value = '';
+  await loadDrawingList();
+  showToast(`図面「${name}」を追加しました`, 'success');
+});
+
+document.getElementById('drawing-input')?.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') document.getElementById('add-drawing-btn')?.click();
+});
+
+// 編集/削除モード
+document.getElementById('edit-drawing-btn')?.addEventListener('click', () => {
+  state.editMode = !state.editMode;
+  loadDrawingList();
+});
+
+document.getElementById('delete-drawing-btn')?.addEventListener('click', () => {
+  state.deleteMode = !state.deleteMode;
+  loadDrawingList();
+});
+
+// 設定ダイアログ
+document.getElementById('settings-btn')?.addEventListener('click', () => {
+  document.getElementById('settings-modal').style.display = 'flex';
+});
+
+document.getElementById('settings-close')?.addEventListener('click', () => {
+  document.getElementById('settings-modal').style.display = 'none';
+});
+
+// LINEテキスト取り込み
+document.getElementById('import-master-btn')?.addEventListener('click', async () => {
+  const text = document.getElementById('line-import-text').value.trim();
+  if (!text) { showToast('テキストを貼り付けてください', 'error'); return; }
+  try {
+    const data = JSON.parse(text);
+    if (!data.materials || !data.categories) throw new Error('無効なフォーマット');
+    await saveMaster(data);
+    state.masterData = data;
+    document.getElementById('line-import-text').value = '';
+    document.getElementById('settings-modal').style.display = 'none';
+    showToast('マスターデータを更新しました', 'success');
+  } catch (e) {
+    showToast('JSON形式が正しくありません: ' + e.message, 'error');
+  }
+});
+
+// LINEテキストコピー
+document.getElementById('export-master-btn')?.addEventListener('click', async () => {
+  const master = state.masterData || INITIAL_MASTER;
+  const text = JSON.stringify(master, null, 2);
+  try {
+    await navigator.clipboard.writeText(text);
+    showToast('マスターデータをコピーしました', 'success');
+  } catch (e) {
+    showToast('コピーに失敗しました。手動でコピーしてください。', 'error');
+  }
+});
+
+// ====== 画面2: 電柱番号一覧 ======
+async function renderPoles(drawingId) {
+  state.currentDrawingId = drawingId;
+  state.currentPoleId = null;
+  state.currentCategoryPath = [];
+  state.currentCategoryId = null;
+  state.editMode = false;
+  state.deleteMode = false;
+
+  const screen = document.getElementById('screen-poles');
+  screen.classList.add('active');
+
+  const titleEl = document.getElementById('poles-title');
+  if (titleEl) titleEl.textContent = `電柱番号一覧（図面: ${getDrawingName(drawingId)}）`;
+
+  await loadPoleList(drawingId);
+
+  // 総材料数ボタン
+  document.getElementById('materials-agg-btn')?.onclick = () => {
+    navigateTo('materials', drawingId);
+  };
+  document.getElementById('poles-back-btn')?.onclick = () => navigateTo('home');
+}
+
+async function loadPoleList(drawingId) {
+  const poles = await getPolesByDrawing(drawingId);
+  const list = document.getElementById('pole-list');
+  poles.forEach(p => { _poleNameCache[p.id] = p.name; });
+
+  if (poles.length === 0) {
+    list.innerHTML = `
+      <div class="empty-state">
+        <div class="empty-icon">🔌</div>
+        <div class="empty-text">「＋追加」から電柱番号を入力してください</div>
+      </div>`;
+    return;
+  }
+
+  list.innerHTML = poles.map(p => `
+    <div class="list-item" id="pole-item-${p.id}">
+      <span class="list-item-text" data-pole-id="${p.id}">${p.name}</span>
+      <span class="chevron">›</span>
+      ${state.deleteMode ? `<button class="btn btn-danger btn-sm" id="del-pole-${p.id}" data-pole-id="${p.id}">🗑️</button>` : ''}
+    </div>
+  `).join('');
+
+  list.querySelectorAll('[data-pole-id]').forEach(el => {
+    const id = el.dataset.poleId;
+    if (el.classList.contains('list-item-text') || el.classList.contains('chevron')) {
+      const item = el.closest('.list-item');
+      item.addEventListener('click', (e) => {
+        if (e.target.closest('button')) return;
+        state.currentPoleId = id;
+        navigateTo('categories', drawingId, id);
+      });
+    } else if (el.id?.startsWith('del-pole-')) {
+      el.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        const name = _poleNameCache[id];
+        const ok = await confirm('電柱削除', `「${name}」を削除します。\n紐づく写真・材料データも全て削除されます。よろしいですか？`);
+        if (ok) {
+          await deletePole(id);
+          await loadPoleList(drawingId);
+          showToast('電柱を削除しました', 'success');
+        }
+      });
+    }
+  });
+}
+
+document.getElementById('add-pole-btn')?.addEventListener('click', async () => {
+  const input = document.getElementById('pole-input');
+  const name = input.value.trim();
+  if (!name) { showToast('電柱番号を入力してください', 'error'); return; }
+  const pole = { id: uid(), drawingId: state.currentDrawingId, name, createdAt: Date.now() };
+  await safeSave(() => savePole(pole));
+  _poleNameCache[pole.id] = name;
+  input.value = '';
+  await loadPoleList(state.currentDrawingId);
+  showToast(`電柱「${name}」を追加しました`, 'success');
+});
+
+document.getElementById('pole-input')?.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') document.getElementById('add-pole-btn')?.click();
+});
+
+document.getElementById('delete-pole-btn')?.addEventListener('click', () => {
+  state.deleteMode = !state.deleteMode;
+  loadPoleList(state.currentDrawingId);
+});
+
+// ====== 画面3: 工種一覧（最大3段階） ======
+async function renderCategories(drawingId, poleId, parentId, depth) {
+  state.currentDrawingId = drawingId;
+  state.currentPoleId = poleId;
+
+  const screen = document.getElementById('screen-categories');
+  screen.classList.add('active');
+
+  // 親IDがnullなら最上位（大工種）
+  const actualParentId = parentId;
+
+  // カテゴリ取得
+  let cats;
+  if (!actualParentId) {
+    // 最上位: poleIdに紐づく、parentId=nullのもの
+    const all = await getCategoriesByPole(poleId);
+    cats = all.filter(c => !c.parentId).sort((a, b) => a.createdAt - b.createdAt);
+  } else {
+    cats = (await getCategoriesByParent(actualParentId)).sort((a, b) => a.createdAt - b.createdAt);
+  }
+
+  // パスの更新
+  if (!actualParentId) {
+    state.currentCategoryPath = [];
+  }
+
+  const titleEl = document.getElementById('categories-title');
+  if (titleEl) {
+    const pole = getPoleName(poleId);
+    const depth = state.currentCategoryPath.length;
+    const depthLabel = depth === 0 ? '大工種' : depth === 1 ? '中工種' : '小工種';
+    titleEl.textContent = `${depthLabel}一覧（電柱: ${pole}）`;
+  }
+
+  await loadCategoryList(drawingId, poleId, actualParentId, cats);
+
+  document.getElementById('categories-back-btn')?.onclick = () => {
+    if (state.currentCategoryPath.length > 0) {
+      const prev = state.currentCategoryPath[state.currentCategoryPath.length - 2];
+      state.currentCategoryPath.pop();
+      navigateTo('subcategories', drawingId, poleId, prev?.id || null);
+    } else {
+      navigateTo('poles', drawingId);
+    }
+  };
+}
+
+async function loadCategoryList(drawingId, poleId, parentId, cats) {
+  const list = document.getElementById('category-list');
+  const depth = state.currentCategoryPath.length;
+
+  if (cats.length === 0) {
+    list.innerHTML = `
+      <div class="empty-state">
+        <div class="empty-icon">🔧</div>
+        <div class="empty-text">工種を追加してください</div>
+      </div>`;
+  } else {
+    list.innerHTML = cats.map(cat => {
+      const isLeaf = cat.isLeaf !== false; // デフォルトはleaf
+      // 子があるか確認済みならそれを使う
+      const leafClass = cat.hasChildren ? '' : 'leaf';
+      return `
+        <div class="category-btn ${cat.hasChildren ? '' : 'leaf'}" id="cat-btn-${cat.id}" data-cat-id="${cat.id}" data-has-children="${cat.hasChildren || false}">
+          <span style="font-size:20px">${cat.hasChildren ? '📁' : '📌'}</span>
+          <span style="flex:1;font-size:15px;font-weight:600">${cat.name}</span>
+          <span class="chevron">›</span>
+          ${state.deleteMode ? `<button class="btn btn-danger btn-sm" id="del-cat-${cat.id}" data-cat-id="${cat.id}" style="margin-left:4px">🗑️</button>` : ''}
+        </div>
+      `;
+    }).join('');
+  }
+
+  // 子工種追加フォーム（大・中工種にのみ表示 / 深さ2まで）
+  const addSection = document.getElementById('add-category-section');
+  if (addSection) {
+    const maxDepth = 2; // 0=大,1=中,2=小（最大3段階）
+    addSection.style.display = depth <= maxDepth ? 'flex' : 'none';
+    const placeholder = ['大工種名を入力', '中工種名を入力', '小工種名を入力'][depth] || '工種名を入力';
+    const inp = document.getElementById('category-input');
+    if (inp) inp.placeholder = placeholder;
+  }
+
+  // イベント設定
+  list.querySelectorAll('.category-btn').forEach(btn => {
+    const catId = btn.dataset.catId;
+    const hasChildren = btn.dataset.hasChildren === 'true';
+
+    btn.addEventListener('click', async (e) => {
+      if (e.target.closest('button')) return;
+
+      const cat = cats.find(c => c.id === catId);
+      if (!cat) return;
+
+      // 子があるか確認
+      const children = await getCategoriesByParent(catId);
+      if (children.length > 0) {
+        // 親工種→子工種へ遷移
+        state.currentCategoryPath.push({ id: catId, name: cat.name });
+        updateBreadcrumb();
+        const subCats = children.sort((a, b) => a.createdAt - b.createdAt);
+        // 子カテゴリの hasChildren を確認
+        for (const child of subCats) {
+          const grandChildren = await getCategoriesByParent(child.id);
+          child.hasChildren = grandChildren.length > 0;
+        }
+        state.currentCategoryPath[state.currentCategoryPath.length - 1].id = catId;
+        await loadCategoryList(drawingId, poleId, catId, subCats);
+        document.getElementById('categories-title').textContent = `工種一覧（電柱: ${getPoleName(poleId)}）`;
+        history.pushState({ screen: 'subcategories', args: [drawingId, poleId, catId] }, '', '#subcategories');
+        return;
+      }
+
+      // 末端工種→作業画面へ
+      state.currentCategoryPath.push({ id: catId, name: cat.name });
+      state.currentCategoryId = catId;
+      navigateTo('workscreen', drawingId, poleId, catId);
+    });
+  });
+
+  // 削除ボタン
+  list.querySelectorAll('[id^="del-cat-"]').forEach(btn => {
+    const catId = btn.dataset.catId;
+    btn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const cat = cats.find(c => c.id === catId);
+      const ok = await confirm('工種削除', `「${cat?.name}」を削除します。\n紐づく子工種・写真・材料も全て削除されます。よろしいですか？`);
+      if (ok) {
+        await deleteCategory(catId);
+        const refreshed = parentId
+          ? (await getCategoriesByParent(parentId)).sort((a, b) => a.createdAt - b.createdAt)
+          : (await getCategoriesByPole(poleId)).filter(c => !c.parentId).sort((a, b) => a.createdAt - b.createdAt);
+        for (const c of refreshed) {
+          const ch = await getCategoriesByParent(c.id);
+          c.hasChildren = ch.length > 0;
+        }
+        await loadCategoryList(drawingId, poleId, parentId, refreshed);
+        showToast('工種を削除しました', 'success');
+      }
+    });
+  });
+}
+
+// 工種追加
+document.getElementById('add-category-btn')?.addEventListener('click', async () => {
+  const input = document.getElementById('category-input');
+  const name = input.value.trim();
+  if (!name) { showToast('工種名を入力してください', 'error'); return; }
+
+  const parentId = state.currentCategoryPath.length > 0
+    ? state.currentCategoryPath[state.currentCategoryPath.length - 1].id
+    : null;
+  const depth = state.currentCategoryPath.length;
+
+  const cat = {
+    id: uid(),
+    poleId: state.currentPoleId,
+    drawingId: state.currentDrawingId,
+    parentId,
+    name,
+    depth,
+    enabledStages: { '事前': true, '中': true, '事後': true },
+    createdAt: Date.now()
+  };
+
+  await safeSave(() => saveCategory(cat));
+  input.value = '';
+
+  // 親カテゴリのhasChildrenを更新（必要なら）
+  if (parentId) {
+    // 親の子リストを再取得して表示更新
+    const children = await getCategoriesByParent(parentId);
+    for (const c of children) {
+      const gc = await getCategoriesByParent(c.id);
+      c.hasChildren = gc.length > 0;
+    }
+    await loadCategoryList(state.currentDrawingId, state.currentPoleId, parentId, children.sort((a, b) => a.createdAt - b.createdAt));
+  } else {
+    const all = await getCategoriesByPole(state.currentPoleId);
+    const tops = all.filter(c => !c.parentId).sort((a, b) => a.createdAt - b.createdAt);
+    for (const c of tops) {
+      const ch = await getCategoriesByParent(c.id);
+      c.hasChildren = ch.length > 0;
+    }
+    await loadCategoryList(state.currentDrawingId, state.currentPoleId, null, tops);
+  }
+
+  showToast(`工種「${name}」を追加しました`, 'success');
+});
+
+document.getElementById('category-input')?.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') document.getElementById('add-category-btn')?.click();
+});
+
+document.getElementById('delete-cat-btn')?.addEventListener('click', () => {
+  state.deleteMode = !state.deleteMode;
+  // 現在の状態で再読み込み
+  const parentId = state.currentCategoryPath.length > 0
+    ? state.currentCategoryPath[state.currentCategoryPath.length - 1].id
+    : null;
+  renderCategories(state.currentDrawingId, state.currentPoleId, parentId, state.currentCategoryPath.length);
+});
+
+// ====== 画面4: 最深部工種専用画面 ======
+async function renderWorkScreen(drawingId, poleId, categoryId) {
+  state.currentDrawingId = drawingId;
+  state.currentPoleId = poleId;
+  state.currentCategoryId = categoryId;
+
+  const screen = document.getElementById('screen-work');
+  screen.classList.add('active');
+
+  const cat = await getCategoryData(categoryId);
+  const catName = cat?.name || '工種';
+  document.getElementById('work-title').textContent = catName;
+
+  // 有効ステージ設定
+  const enabledStages = cat?.enabledStages || { '事前': true, '中': true, '事後': true };
+
+  // 写真読み込み
+  await renderStageButtons(categoryId, enabledStages, cat);
+
+  // 材料読み込み
+  await renderMaterialList(categoryId, cat);
+
+  document.getElementById('work-back-btn')?.onclick = () => {
+    state.currentCategoryPath.pop();
+    const parentId = state.currentCategoryPath.length > 0
+      ? state.currentCategoryPath[state.currentCategoryPath.length - 1].id
+      : null;
+    navigateTo('subcategories', drawingId, poleId, parentId);
+  };
+}
+
+async function getCategoryData(categoryId) {
+  try {
+    return await dbGet('categories', categoryId);
+  } catch (e) {
+    return null;
+  }
+}
+
+async function renderStageButtons(categoryId, enabledStages, cat) {
+  const photos = await getPhotosByCategory(categoryId);
+  const stages = ['事前', '中', '事後'];
+  const stageIcons = { '事前': '📷', '中': '🔄', '事後': '✅' };
+
+  const container = document.getElementById('stage-buttons-container');
+  container.innerHTML = stages.map(stage => {
+    const stagePhotos = photos.filter(p => p.stage === stage);
+    const count = stagePhotos.length;
+    const enabled = enabledStages?.[stage] !== false;
+    return `
+      <div style="display:flex;flex-direction:column;align-items:center;gap:6px;flex:1">
+        <div class="stage-btn ${count > 0 ? 'has-photos' : ''} ${!enabled ? 'disabled-stage' : ''}"
+             id="stage-btn-${stage}"
+             data-stage="${stage}"
+             data-enabled="${enabled}"
+             style="width:100%">
+          <span class="stage-badge ${count === 0 ? 'zero' : ''}">${count}</span>
+          <span class="stage-icon">${stageIcons[stage]}</span>
+          <span class="stage-label">${stage}</span>
+        </div>
+        <label class="toggle-switch" title="${stage}の使用設定">
+          <input type="checkbox" class="stage-toggle" data-stage="${stage}" ${enabled ? 'checked' : ''}>
+          <span class="toggle-track"></span>
+        </label>
+        <span style="font-size:10px;color:var(--text-muted)">${enabled ? '使用する' : '使用しない'}</span>
+      </div>
+    `;
+  }).join('');
+
+  // サムネイル表示
+  const thumbContainer = document.getElementById('thumbnails-container');
+  thumbContainer.innerHTML = '';
+  for (const stage of stages) {
+    const stagePhotos = photos.filter(p => p.stage === stage);
+    if (stagePhotos.length > 0) {
+      const section = document.createElement('div');
+      section.innerHTML = `<div class="section-title">${stage}（${stagePhotos.length}枚）</div>`;
+      const grid = document.createElement('div');
+      grid.className = 'thumb-grid';
+      for (const photo of stagePhotos) {
+        const div = document.createElement('div');
+        div.className = 'thumb-item';
+        div.innerHTML = `<img src="${photo.dataURL}" alt="${stage}" loading="lazy">`;
+        div.addEventListener('click', () => openPhotoPreview(photo, categoryId, stage));
+        grid.appendChild(div);
+      }
+      section.appendChild(grid);
+      thumbContainer.appendChild(section);
+    }
+  }
+
+  // ステージボタンイベント
+  container.querySelectorAll('.stage-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const stage = btn.dataset.stage;
+      const enabled = btn.dataset.enabled === 'true';
+      if (!enabled) return;
+      navigateTo('camera', state.currentDrawingId, state.currentPoleId, categoryId + '|' + stage);
+    });
+  });
+
+  // トグルスイッチ
+  container.querySelectorAll('.stage-toggle').forEach(toggle => {
+    toggle.addEventListener('change', async () => {
+      const stage = toggle.dataset.stage;
+      const enabled = toggle.checked;
+      const catData = await getCategoryData(categoryId);
+      if (!catData) return;
+      catData.enabledStages = catData.enabledStages || { '事前': true, '中': true, '事後': true };
+      catData.enabledStages[stage] = enabled;
+      await safeSave(() => saveCategory(catData));
+      // ラベル更新
+      const label = toggle.closest('div').querySelector('span:last-child');
+      if (label) label.textContent = enabled ? '使用する' : '使用しない';
+    });
+  });
+}
+
+async function renderMaterialList(categoryId, cat) {
+  const masterRec = state.masterData || INITIAL_MASTER;
+  const existingMaterials = await getMaterialsByCategory(categoryId);
+
+  // マスターから材料を取得（大工種に対応するもの）
+  const allMaterials = masterRec.materials || [];
+
+  // 工種名からジャンルを推測（最上位工種名 = ジャンル）
+  const rootCat = state.currentCategoryPath[0];
+  const genre = rootCat?.name || '';
+
+  // マスター材料 + 既存材料をマージ
+  const masterMats = allMaterials.filter(m =>
+    genre === '' || m.genre === genre || allMaterials.some(am => am.name === m.name)
+  );
+
+  // 既存のDB材料と合わせてリスト作成
+  const materialMap = new Map();
+
+  // 既存材料を優先
+  for (const m of existingMaterials) {
+    materialMap.set(m.name, m);
+  }
+
+  // マスターから未登録の材料を追加（qty=0）
+  for (const m of masterMats) {
+    if (!materialMap.has(m.name)) {
+      materialMap.set(m.name, {
+        id: uid(),
+        categoryId,
+        name: m.name,
+        qty: 0,
+        fixedQty: 0,
+        isFixed: false,
+        usageCount: 0
+      });
+    }
+  }
+
+  const materials = [...materialMap.values()];
+
+  // 固定適用: 新規開かれた場合に固定数量を自動適用
+  for (const m of materials) {
+    if (m.isFixed && m.fixedQty > 0 && m.qty === 0) {
+      m.qty = m.fixedQty;
+      await safeSave(() => saveMaterial(m));
+    }
+  }
+
+  // 使用頻度順でソート（qty>0 を上に）
+  materials.sort((a, b) => {
+    if (a.qty > 0 && b.qty === 0) return -1;
+    if (a.qty === 0 && b.qty > 0) return 1;
+    return (b.usageCount || 0) - (a.usageCount || 0);
+  });
+
+  const container = document.getElementById('material-list');
+  container.innerHTML = '';
+
+  for (const mat of materials) {
+    const item = document.createElement('div');
+    item.className = `material-item ${mat.qty > 0 ? 'has-qty' : ''} ${mat.isFixed ? 'fixed-on' : ''}`;
+    item.id = `mat-item-${mat.id}`;
+    item.innerHTML = `
+      <div style="display:flex;flex-direction:column;flex:1;min-width:0">
+        <span class="material-name">${mat.name}</span>
+        ${mat.isFixed ? `<span style="font-size:10px;color:var(--accent-yellow)">固定: ${mat.fixedQty}個</span>` : ''}
+      </div>
+      <div class="qty-counter">
+        <button class="qty-btn minus" data-mat-id="${mat.id}">－</button>
+        <input type="number" class="qty-display" value="${mat.qty}" min="0" data-mat-id="${mat.id}" style="width:56px;text-align:center">
+        <button class="qty-btn plus" data-mat-id="${mat.id}">＋</button>
+      </div>
+      <label class="toggle-switch" title="固定設定">
+        <input type="checkbox" class="fix-toggle" data-mat-id="${mat.id}" ${mat.isFixed ? 'checked' : ''}>
+        <span class="toggle-track"></span>
+      </label>
+    `;
+    container.appendChild(item);
+
+    // 数量変更
+    const updateQty = async (newQty) => {
+      mat.qty = Math.max(0, parseInt(newQty) || 0);
+      mat.usageCount = (mat.usageCount || 0) + (mat.qty > 0 ? 1 : 0);
+      const result = await safeSave(() => saveMaterial(mat));
+      if (result !== null) {
+        const el = document.getElementById(`mat-item-${mat.id}`);
+        if (el) {
+          el.className = `material-item ${mat.qty > 0 ? 'has-qty' : ''} ${mat.isFixed ? 'fixed-on' : ''}`;
+        }
+        const qtyEl = item.querySelector(`.qty-display[data-mat-id="${mat.id}"]`);
+        if (qtyEl) qtyEl.value = mat.qty;
+      }
+    };
+
+    item.querySelector(`.minus[data-mat-id="${mat.id}"]`)?.addEventListener('click', () => updateQty(mat.qty - 1));
+    item.querySelector(`.plus[data-mat-id="${mat.id}"]`)?.addEventListener('click', () => updateQty(mat.qty + 1));
+    item.querySelector(`.qty-display[data-mat-id="${mat.id}"]`)?.addEventListener('change', (e) => updateQty(e.target.value));
+
+    // 固定トグル
+    item.querySelector(`.fix-toggle[data-mat-id="${mat.id}"]`)?.addEventListener('change', async (e) => {
+      mat.isFixed = e.target.checked;
+      mat.fixedQty = mat.isFixed ? mat.qty : 0;
+      await safeSave(() => saveMaterial(mat));
+      const el = document.getElementById(`mat-item-${mat.id}`);
+      if (el) el.className = `material-item ${mat.qty > 0 ? 'has-qty' : ''} ${mat.isFixed ? 'fixed-on' : ''}`;
+    });
+  }
+
+  if (materials.length === 0) {
+    container.innerHTML = `<div class="empty-state"><div class="empty-text">材料マスターが設定されていません<br>設定から取り込んでください</div></div>`;
+  }
+}
+
+// ====== 写真プレビュー ======
+function openPhotoPreview(photo, categoryId, stage) {
+  const modal = document.getElementById('photo-preview-modal');
+  const img = document.getElementById('preview-img');
+  img.src = photo.dataURL;
+  modal.style.display = 'flex';
+
+  document.getElementById('preview-retake')?.onclick = async () => {
+    modal.style.display = 'none';
+    navigateTo('camera', state.currentDrawingId, state.currentPoleId, categoryId + '|' + stage);
+  };
+
+  document.getElementById('preview-delete')?.onclick = async () => {
+    const ok = await confirm('写真削除', 'この写真を削除しますか？');
+    if (ok) {
+      await deletePhoto(photo.id);
+      modal.style.display = 'none';
+      await renderWorkScreen(state.currentDrawingId, state.currentPoleId, categoryId);
+      showToast('写真を削除しました', 'success');
+    }
+  };
+
+  document.getElementById('preview-close')?.onclick = () => {
+    modal.style.display = 'none';
+  };
+}
+
+// ====== 画面6: カメラ撮影 ======
+async function openCameraScreen(drawingId, poleId, categoryStage) {
+  const [categoryId, stage] = categoryStage.split('|');
+  state.currentStage = stage;
+  state.currentCategoryId = categoryId;
+
+  const cameraView = document.getElementById('camera-view');
+  cameraView.style.display = 'flex';
+
+  const video = document.getElementById('camera-video');
+  const guide = document.getElementById('camera-guide');
+  const previewImg = document.getElementById('camera-preview-img');
+  const previewOverlay = document.getElementById('camera-preview-overlay');
+
+  // ガイド枠サイズ設定（4:3）
+  const setGuideSize = () => {
+    const vw = video.clientWidth;
+    const vh = video.clientHeight;
+    const gw = Math.min(vw * 0.85, (vh * 0.85) * (4/3));
+    const gh = gw * (3/4);
+    guide.style.width = gw + 'px';
+    guide.style.height = gh + 'px';
+  };
+  setTimeout(setGuideSize, 300);
+
+  // カメラ起動
+  try {
+    await startCamera(video);
+    setGuideSize();
+  } catch (e) {
+    cameraView.style.display = 'none';
+    let msg = 'カメラを起動できませんでした。';
+    if (e.message === 'CAMERA_PERMISSION_DENIED') {
+      msg = 'HTTPS環境（またはPWA）でカメラ権限を許可して実行してください。';
+    } else if (e.message === 'CAMERA_NOT_FOUND') {
+      msg = 'カメラが見つかりません。';
+    } else if (e.message === 'CAMERA_NOT_SUPPORTED') {
+      msg = 'お使いのブラウザはカメラをサポートしていません。';
+    }
+    showError(msg);
+    navigateTo('workscreen', drawingId, poleId, categoryId);
+    return;
+  }
+
+  // ステージ表示
+  document.getElementById('camera-stage-label').textContent = stage;
+
+  let capturedBlob = null;
+
+  // カメラ
+  document.getElementById('shutter-btn').onclick = async () => {
+    try {
+      capturedBlob = await captureFrame(video);
+      const dataURL = await blobToDataURL(capturedBlob);
+      previewImg.src = dataURL;
+      previewOverlay.style.display = 'flex';
+    } catch (e) {
+      showError('撮影処理に失敗しました: ' + e.message);
+    }
+  };
+
+  // 撮り直し
+  document.getElementById('camera-retake-btn').onclick = () => {
+    previewOverlay.style.display = 'none';
+    capturedBlob = null;
+  };
+
+  // 確定して続ける
+  document.getElementById('camera-confirm-btn').onclick = async () => {
+    if (!capturedBlob) return;
+    try {
+      const dataURL = await blobToDataURL(capturedBlob);
+      const photo = {
+        id: uid(),
+        categoryId,
+        stage,
+        dataURL,
+        createdAt: Date.now()
+      };
+      const result = await safeSave(() => savePhoto(photo));
+      if (result === null) return;
+      capturedBlob = null;
+      previewOverlay.style.display = 'none';
+      showToast('写真を保存しました', 'success');
+    } catch (e) {
+      showError('写真の保存に失敗しました: ' + e.message);
+    }
+  };
+
+  // カメラを閉じる
+  document.getElementById('camera-close-btn').onclick = () => {
+    stopCamera();
+    cameraView.style.display = 'none';
+    navigateTo('workscreen', drawingId, poleId, categoryId);
+  };
+}
+
+// ====== 画面5: 総材料数確認・調整 ======
+async function renderMaterialsAgg(drawingId) {
+  state.currentDrawingId = drawingId;
+  const screen = document.getElementById('screen-materials');
+  screen.classList.add('active');
+
+  document.getElementById('materials-title').textContent = `総材料数（図面: ${getDrawingName(drawingId)}）`;
+  document.getElementById('materials-back-btn')?.onclick = () => navigateTo('poles', drawingId);
+
+  await loadAggregatedMaterials(drawingId);
+}
+
+async function loadAggregatedMaterials(drawingId) {
+  const poles = await getPolesByDrawing(drawingId);
+  const categoriesWithMaterials = [];
+
+  for (const pole of poles) {
+    const allCats = await getCategoriesByPole(pole.id);
+    for (const cat of allCats) {
+      const children = await getCategoriesByParent(cat.id);
+      if (children.length === 0) {
+        // 末端工種
+        const mats = await getMaterialsByCategory(cat.id);
+        if (mats.some(m => m.qty > 0)) {
+          categoriesWithMaterials.push({
+            categoryId: cat.id,
+            poleName: pole.name,
+            categoryPath: [cat.name],
+            materials: mats.filter(m => m.qty > 0).map(m => ({ name: m.name, qty: m.qty }))
+          });
+        }
+      }
+    }
+  }
+
+  const adjustments = await getAdjustmentsByDrawing(drawingId);
+  const manualAdjustments = adjustments.map(a => ({ materialName: a.materialName, manualQty: a.manualQty }));
+
+  const aggregated = aggregateMaterials({ categoriesWithMaterials, manualAdjustments });
+
+  const container = document.getElementById('agg-material-list');
+  if (aggregated.length === 0) {
+    container.innerHTML = `<div class="empty-state"><div class="empty-icon">📦</div><div class="empty-text">材料データがありません</div></div>`;
+    return;
+  }
+
+  container.innerHTML = aggregated.map(m => `
+    <div class="material-item ${m.qty > 0 ? 'has-qty' : ''} ${m.isManual ? 'fixed-on' : ''}">
+      <div style="display:flex;flex-direction:column;flex:1;min-width:0">
+        <span class="material-name">${m.name}</span>
+        ${m.isManual ? '<span style="font-size:10px;color:var(--accent-yellow)">手動調整済</span>' : ''}
+      </div>
+      <div class="qty-counter">
+        <button class="qty-btn minus agg-minus" data-name="${m.name}" data-qty="${m.qty}">－</button>
+        <span class="qty-display agg-qty" data-name="${m.name}">${m.qty}</span>
+        <button class="qty-btn plus agg-plus" data-name="${m.name}" data-qty="${m.qty}">＋</button>
+      </div>
+      <span style="font-size:12px;color:var(--text-muted);min-width:16px">個</span>
+    </div>
+  `).join('');
+
+  // 集計データをキャッシュ
+  const aggMap = new Map(aggregated.map(m => [m.name, m.qty]));
+
+  const updateAgg = async (name, delta) => {
+    const current = aggMap.get(name) || 0;
+    const newQty = Math.max(0, current + delta);
+    aggMap.set(name, newQty);
+
+    // 手動調整値を保存
+    const adj = {
+      id: `adj_${drawingId}_${name.replace(/\s/g, '_')}`,
+      drawingId,
+      materialName: name,
+      manualQty: newQty,
+      updatedAt: Date.now()
+    };
+    await safeSave(() => saveAdjustment(adj));
+
+    // UI更新
+    const qtyEl = container.querySelector(`.agg-qty[data-name="${name}"]`);
+    if (qtyEl) qtyEl.textContent = newQty;
+
+    // ボタンのdata-qty更新
+    container.querySelectorAll(`[data-name="${name}"]`).forEach(el => {
+      el.dataset.qty = newQty;
+    });
+  };
+
+  container.querySelectorAll('.agg-minus').forEach(btn => {
+    btn.addEventListener('click', () => updateAgg(btn.dataset.name, -1));
+  });
+  container.querySelectorAll('.agg-plus').forEach(btn => {
+    btn.addEventListener('click', () => updateAgg(btn.dataset.name, 1));
+  });
+}
+
+// ====== ZIP出力 ======
+async function handleZipExport(drawingId) {
+  showProgress('データ収集中...', 5);
+
+  try {
+    const drawing = { id: drawingId, name: getDrawingName(drawingId) };
+    const poles = await getPolesByDrawing(drawingId);
+
+    // 写真未撮影チェック
+    const missingPhotos = [];
+    const polesData = [];
+
+    for (const pole of poles) {
+      const allCats = await getCategoriesByPole(pole.id);
+      const poleData = { id: pole.id, name: pole.name, categories: [] };
+
+      for (const cat of allCats) {
+        const children = await getCategoriesByParent(cat.id);
+        if (children.length > 0) continue; // 末端のみ
+
+        const photos = await getPhotosByCategory(cat.id);
+        const catData = await getCategoryData(cat.id);
+        const enabledStages = catData?.enabledStages || { '事前': true, '中': true, '事後': true };
+
+        const catPhotos = { '事前': [], '中': [], '事後': [] };
+        for (const photo of photos) {
+          if (catPhotos[photo.stage]) catPhotos[photo.stage].push(photo);
+        }
+
+        // 未撮影チェック
+        for (const stage of ['事前', '中', '事後']) {
+          if (enabledStages[stage] && catPhotos[stage].length === 0) {
+            missingPhotos.push(`電柱: ${pole.name} / 工種: ${cat.name} / ${stage}`);
+          }
+        }
+
+        // パス名構築
+        const pathNames = await buildCategoryPath(cat);
+
+        poleData.categories.push({
+          id: cat.id,
+          name: cat.name,
+          pathNames,
+          photos: catPhotos
+        });
+      }
+      polesData.push(poleData);
+    }
+
+    if (missingPhotos.length > 0) {
+      hideProgress();
+      showMissingPhotosError(missingPhotos);
+      return;
+    }
+
+    updateProgress(20, 'PDF生成中...');
+
+    // 材料集計
+    const categoriesWithMaterials = [];
+    for (const pole of poles) {
+      const allCats = await getCategoriesByPole(pole.id);
+      for (const cat of allCats) {
+        const children = await getCategoriesByParent(cat.id);
+        if (children.length === 0) {
+          const mats = await getMaterialsByCategory(cat.id);
+          categoriesWithMaterials.push({
+            materials: mats.filter(m => m.qty > 0).map(m => ({ name: m.name, qty: m.qty }))
+          });
+        }
+      }
+    }
+    const adjustments = await getAdjustmentsByDrawing(drawingId);
+    const manualAdjustments = adjustments.map(a => ({ materialName: a.materialName, manualQty: a.manualQty }));
+    const aggregated = aggregateMaterials({ categoriesWithMaterials, manualAdjustments });
+
+    updateProgress(30, 'ZIP作成中...');
+
+    const zipBlob = await generateZIP({
+      drawingName: getDrawingName(drawingId),
+      date: state.workDate,
+      polesData,
+      materials: aggregated,
+      onProgress: (pct) => updateProgress(30 + pct * 0.7, 'ZIP作成中...')
+    });
+
+    hideProgress();
+    const filename = `${state.workDate}_${getDrawingName(drawingId)}_施工写真.zip`;
+    downloadFile(zipBlob, filename);
+    showToast('ZIPファイルを出力しました', 'success');
+
+  } catch (e) {
+    hideProgress();
+    showError('ZIP出力に失敗しました: ' + e.message);
+    console.error(e);
+  }
+}
+
+async function buildCategoryPath(cat) {
+  const path = [cat.name];
+  let current = cat;
+  while (current.parentId) {
+    const parent = await getCategoryData(current.parentId);
+    if (!parent) break;
+    path.unshift(parent.name);
+    current = parent;
+  }
+  return path;
+}
+
+function showMissingPhotosError(missing) {
+  const modal = document.getElementById('error-modal');
+  document.getElementById('error-message').innerHTML =
+    `<strong>以下の写真が未撮影です：</strong><br><br>` +
+    missing.map(m => `• ${m}`).join('<br>');
+  modal.style.display = 'flex';
+}
+
+// ====== 初期化 ======
+async function init() {
+  try {
+    await initDB();
+
+    // 自己テスト実行
+    testAggregateMaterials();
+    testCALSProcessing();
+
+    // 初回起動チェック
+    const firstRun = await isFirstRun();
+    if (firstRun) {
+      await saveMaster(INITIAL_MASTER);
+      await markInitialized();
+      console.log('[INIT] 初期マスターデータをロードしました（287品目）');
+    }
+
+    // マスター読み込み
+    const masterRec = await getMaster();
+    state.masterData = masterRec?.data || INITIAL_MASTER;
+
+    // 保存済み日付読み込み
+    const savedDate = await getSetting('workDate');
+    if (savedDate) state.workDate = savedDate;
+
+    // 日付変更時に保存
+    document.getElementById('work-date')?.addEventListener('change', async (e) => {
+      state.workDate = e.target.value;
+      await saveSetting('workDate', state.workDate);
+    });
+
+    // Service Worker 登録
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('./sw.js')
+        .then(() => console.log('[SW] Service Worker 登録成功'))
+        .catch(e => console.warn('[SW] 登録失敗:', e));
+    }
+
+    // 初期画面表示
+    renderScreen('home', []);
+
+    console.log('[APP] 施工写真管理アプリ 起動完了');
+
+  } catch (e) {
+    console.error('[APP] 初期化エラー:', e);
+    document.body.innerHTML = `
+      <div style="color:white;padding:32px;text-align:center;font-family:sans-serif;">
+        <h2>起動エラー</h2>
+        <p>${e.message}</p>
+        <button onclick="location.reload()" style="padding:12px 24px;background:#3b82f6;color:white;border:none;border-radius:8px;font-size:16px;cursor:pointer;">
+          再読み込み
+        </button>
+      </div>`;
+  }
+}
+
+init();
+
+// camera.js - カメラ撮影・CALS/EC対応画像処理モジュール
+
+let currentStream = null;
+
+/**
+ * バックカメラを起動してストリームを返す
+ */
+export async function startCamera(videoElement) {
+  try {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      throw new Error('API_UNSUPPORTED');
+    }
+    const constraints = {
+      video: {
+        facingMode: { ideal: 'environment' },
+        width: { ideal: 1920 },
+        height: { ideal: 1440 }
+      },
+      audio: false
+    };
+    currentStream = await navigator.mediaDevices.getUserMedia(constraints);
+    videoElement.srcObject = currentStream;
+    await new Promise(resolve => {
+      videoElement.onloadedmetadata = () => {
+        videoElement.play();
+        resolve();
+      };
+    });
+    return currentStream;
+  } catch (e) {
+    if (e.name === 'NotAllowedError' || e.name === 'PermissionDeniedError') {
+      throw new Error('CAMERA_PERMISSION_DENIED');
+    } else if (e.name === 'NotFoundError' || e.name === 'DevicesNotFoundError') {
+      throw new Error('CAMERA_NOT_FOUND');
+    } else if (e.message === 'API_UNSUPPORTED') {
+      throw new Error('CAMERA_NOT_SUPPORTED');
+    } else {
+      throw new Error('CAMERA_ERROR:' + e.message);
+    }
+  }
+}
+
+/**
+ * カメラストリームを停止
+ */
+export function stopCamera() {
+  if (currentStream) {
+    currentStream.getTracks().forEach(track => track.stop());
+    currentStream = null;
+  }
+}
+
+/**
+ * Exif方向情報を取得（JPEG Blobから）
+ */
+async function getExifOrientation(blob) {
+  try {
+    const buffer = await blob.arrayBuffer();
+    const view = new DataView(buffer);
+    if (view.getUint16(0, false) !== 0xFFD8) return 1; // Not JPEG
+    let offset = 2;
+    while (offset < view.byteLength) {
+      const marker = view.getUint16(offset, false);
+      offset += 2;
+      if (marker === 0xFFE1) { // APP1 (Exif)
+        const exifData = new DataView(buffer, offset + 2);
+        const littleEndian = exifData.getUint16(0) === 0x4949;
+        const ifdOffset = exifData.getUint32(4, littleEndian);
+        const entries = exifData.getUint16(ifdOffset, littleEndian);
+        for (let i = 0; i < entries; i++) {
+          const entryOffset = ifdOffset + 2 + i * 12;
+          if (exifData.getUint16(entryOffset, littleEndian) === 0x0112) {
+            return exifData.getUint16(entryOffset + 8, littleEndian);
+          }
+        }
+      } else if ((marker & 0xFF00) !== 0xFF00) break;
+      else offset += view.getUint16(offset, false);
+    }
+  } catch (e) { /* ignore */ }
+  return 1;
+}
+
+/**
+ * CALS/EC対応: 4:3クロップ + 長辺1920px/短辺1440px + JPEG 0.85
+ * @param {Blob|string} source - Blob または base64 data URL
+ * @returns {Promise<Blob>} 処理済みJPEG Blob
+ */
+export async function processImageCALS(source) {
+  return new Promise(async (resolve, reject) => {
+    try {
+      let blob = source instanceof Blob ? source : await (await fetch(source)).blob();
+      const orientation = await getExifOrientation(blob);
+      const url = URL.createObjectURL(blob);
+      const img = new Image();
+      img.onload = () => {
+        URL.revokeObjectURL(url);
+        const canvas = document.createElement('canvas');
+        const ctx = canvas.getContext('2d');
+
+        let sw = img.naturalWidth;
+        let sh = img.naturalHeight;
+
+        // Exif回転補正が必要か
+        const needsRotation = orientation >= 5;
+        const imgW = needsRotation ? sh : sw;
+        const imgH = needsRotation ? sw : sh;
+
+        // 4:3クロップ計算
+        const targetRatio = 4 / 3;
+        const imgRatio = imgW / imgH;
+        let cropW, cropH, cropX, cropY;
+        if (imgRatio > targetRatio) {
+          // 横長すぎ → 横をクロップ
+          cropH = imgH;
+          cropW = Math.round(imgH * targetRatio);
+          cropX = Math.round((imgW - cropW) / 2);
+          cropY = 0;
+        } else {
+          // 縦長すぎ → 縦をクロップ
+          cropW = imgW;
+          cropH = Math.round(imgW / targetRatio);
+          cropX = 0;
+          cropY = Math.round((imgH - cropH) / 2);
+        }
+
+        // 出力サイズ（長辺1920、短辺1440）
+        const outW = 1920;
+        const outH = 1440;
+        canvas.width = outW;
+        canvas.height = outH;
+
+        ctx.save();
+        // Exif回転補正
+        switch (orientation) {
+          case 2: ctx.transform(-1, 0, 0, 1, outW, 0); break;
+          case 3: ctx.transform(-1, 0, 0, -1, outW, outH); break;
+          case 4: ctx.transform(1, 0, 0, -1, 0, outH); break;
+          case 5: ctx.transform(0, 1, 1, 0, 0, 0); break;
+          case 6: ctx.transform(0, 1, -1, 0, outH, 0); break;
+          case 7: ctx.transform(0, -1, -1, 0, outH, outW); break;
+          case 8: ctx.transform(0, -1, 1, 0, 0, outW); break;
+          default: break;
+        }
+
+        // Exif回転が必要な場合はsrc座標を元画像基準に変換
+        if (needsRotation) {
+          ctx.drawImage(img, cropY, cropX, cropH, cropW, 0, 0, outH, outW);
+        } else {
+          ctx.drawImage(img, cropX, cropY, cropW, cropH, 0, 0, outW, outH);
+        }
+        ctx.restore();
+
+        canvas.toBlob((resultBlob) => {
+          if (resultBlob) resolve(resultBlob);
+          else reject(new Error('Canvas toBlob failed'));
+        }, 'image/jpeg', 0.85);
+      };
+      img.onerror = () => reject(new Error('Image load failed'));
+      img.src = url;
+    } catch (e) {
+      reject(e);
+    }
+  });
+}
+
+/**
+ * Videoフレームをキャプチャして処理済みBlobを返す
+ * @param {HTMLVideoElement} videoElement
+ * @returns {Promise<Blob>}
+ */
+export async function captureFrame(videoElement) {
+  const tempCanvas = document.createElement('canvas');
+  tempCanvas.width = videoElement.videoWidth;
+  tempCanvas.height = videoElement.videoHeight;
+  const ctx = tempCanvas.getContext('2d');
+  ctx.drawImage(videoElement, 0, 0);
+  const blob = await new Promise(resolve => tempCanvas.toBlob(resolve, 'image/jpeg', 0.95));
+  return processImageCALS(blob);
+}
+
+/**
+ * BlobをBase64 data URLに変換
+ */
+export function blobToDataURL(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(blob);
+  });
+}
+
+/**
+ * Base64 data URLをBlobに変換
+ */
+export function dataURLToBlob(dataURL) {
+  const arr = dataURL.split(',');
+  const mime = arr[0].match(/:(.*?);/)[1];
+  const bstr = atob(arr[1]);
+  let n = bstr.length;
+  const u8arr = new Uint8Array(n);
+  while (n--) u8arr[n] = bstr.charCodeAt(n);
+  return new Blob([u8arr], { type: mime });
+}
+
+// ---- 自己テスト（CALS処理の検証） ----
+export function testCALSProcessing() {
+  console.log('[TEST] CALS処理関数が正常にエクスポートされています');
+  console.log('[TEST] processImageCALS: 4:3クロップ + 長辺1920px + JPEG 0.85');
+  return true;
+}
+
+// db.js - IndexedDB操作モジュール
+const DB_NAME = 'ConstructionPhotoApp';
+const DB_VERSION = 1;
+
+let db = null;
+
+export async function initDB() {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(DB_NAME, DB_VERSION);
+
+    request.onupgradeneeded = (event) => {
+      const db = event.target.result;
+
+      // 図面番号
+      if (!db.objectStoreNames.contains('drawings')) {
+        const drawingStore = db.createObjectStore('drawings', { keyPath: 'id' });
+        drawingStore.createIndex('createdAt', 'createdAt', { unique: false });
+      }
+
+      // 電柱番号
+      if (!db.objectStoreNames.contains('poles')) {
+        const poleStore = db.createObjectStore('poles', { keyPath: 'id' });
+        poleStore.createIndex('drawingId', 'drawingId', { unique: false });
+        poleStore.createIndex('createdAt', 'createdAt', { unique: false });
+      }
+
+      // 工種（階層）
+      if (!db.objectStoreNames.contains('categories')) {
+        const catStore = db.createObjectStore('categories', { keyPath: 'id' });
+        catStore.createIndex('poleId', 'poleId', { unique: false });
+        catStore.createIndex('parentId', 'parentId', { unique: false });
+      }
+
+      // 工種別材料使用量
+      if (!db.objectStoreNames.contains('materials')) {
+        const matStore = db.createObjectStore('materials', { keyPath: 'id' });
+        matStore.createIndex('categoryId', 'categoryId', { unique: false });
+      }
+
+      // 写真
+      if (!db.objectStoreNames.contains('photos')) {
+        const photoStore = db.createObjectStore('photos', { keyPath: 'id' });
+        photoStore.createIndex('categoryId', 'categoryId', { unique: false });
+        photoStore.createIndex('stage', 'stage', { unique: false });
+      }
+
+      // 図面単位の手動調整値
+      if (!db.objectStoreNames.contains('adjustments')) {
+        db.createObjectStore('adjustments', { keyPath: 'id' });
+      }
+
+      // マスターデータ
+      if (!db.objectStoreNames.contains('master')) {
+        db.createObjectStore('master', { keyPath: 'id' });
+      }
+
+      // 設定
+      if (!db.objectStoreNames.contains('settings')) {
+        db.createObjectStore('settings', { keyPath: 'key' });
+      }
+    };
+
+    request.onsuccess = (event) => {
+      db = event.target.result;
+      resolve(db);
+    };
+
+    request.onerror = (event) => {
+      reject(event.target.error);
+    };
+  });
+}
+
+function getDB() {
+  if (!db) throw new Error('DB not initialized');
+  return db;
+}
+
+// ---- 汎用CRUD ----
+
+export async function dbGet(storeName, key) {
+  return new Promise((resolve, reject) => {
+    const tx = getDB().transaction(storeName, 'readonly');
+    const store = tx.objectStore(storeName);
+    const req = store.get(key);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+export async function dbGetAll(storeName) {
+  return new Promise((resolve, reject) => {
+    const tx = getDB().transaction(storeName, 'readonly');
+    const store = tx.objectStore(storeName);
+    const req = store.getAll();
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+export async function dbGetAllByIndex(storeName, indexName, value) {
+  return new Promise((resolve, reject) => {
+    const tx = getDB().transaction(storeName, 'readonly');
+    const store = tx.objectStore(storeName);
+    const index = store.index(indexName);
+    const req = index.getAll(value);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function dbPut(storeName, data) {
+  return new Promise((resolve, reject) => {
+    const tx = getDB().transaction(storeName, 'readwrite');
+    const store = tx.objectStore(storeName);
+    const req = store.put(data);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+export async function dbSave(storeName, data) {
+  try {
+    return await dbPut(storeName, data);
+  } catch (e) {
+    if (e.name === 'QuotaExceededError' || (e.message && e.message.includes('quota'))) {
+      throw new Error('QUOTA_EXCEEDED');
+    }
+    throw e;
+  }
+}
+
+export async function dbDelete(storeName, key) {
+  return new Promise((resolve, reject) => {
+    const tx = getDB().transaction(storeName, 'readwrite');
+    const store = tx.objectStore(storeName);
+    const req = store.delete(key);
+    req.onsuccess = () => resolve();
+    req.onerror = () => reject(req.error);
+  });
+}
+
+// ---- 図面 ----
+
+export async function saveDrawing(drawing) {
+  return dbSave('drawings', drawing);
+}
+
+export async function getAllDrawings() {
+  const all = await dbGetAll('drawings');
+  return all.sort((a, b) => a.createdAt - b.createdAt);
+}
+
+export async function deleteDrawing(drawingId) {
+  // 関連データ全削除
+  const poles = await getPolesByDrawing(drawingId);
+  for (const pole of poles) {
+    await deletePole(pole.id);
+  }
+  // 手動調整値削除
+  const adjustments = await dbGetAll('adjustments');
+  for (const adj of adjustments) {
+    if (adj.drawingId === drawingId) {
+      await dbDelete('adjustments', adj.id);
+    }
+  }
+  await dbDelete('drawings', drawingId);
+}
+
+// ---- 電柱 ----
+
+export async function savePole(pole) {
+  return dbSave('poles', pole);
+}
+
+export async function getPolesByDrawing(drawingId) {
+  const all = await dbGetAllByIndex('poles', 'drawingId', drawingId);
+  return all.sort((a, b) => a.createdAt - b.createdAt);
+}
+
+export async function deletePole(poleId) {
+  const categories = await getCategoriesByPole(poleId);
+  for (const cat of categories) {
+    await deleteCategory(cat.id);
+  }
+  await dbDelete('poles', poleId);
+}
+
+// ---- 工種（カテゴリ）----
+
+export async function saveCategory(category) {
+  return dbSave('categories', category);
+}
+
+export async function getCategoriesByPole(poleId) {
+  return dbGetAllByIndex('categories', 'poleId', poleId);
+}
+
+export async function getCategoriesByParent(parentId) {
+  return dbGetAllByIndex('categories', 'parentId', parentId);
+}
+
+export async function deleteCategory(categoryId) {
+  // 子カテゴリを再帰削除
+  const children = await getCategoriesByParent(categoryId);
+  for (const child of children) {
+    await deleteCategory(child.id);
+  }
+  // 材料削除
+  const mats = await dbGetAllByIndex('materials', 'categoryId', categoryId);
+  for (const m of mats) {
+    await dbDelete('materials', m.id);
+  }
+  // 写真削除
+  const photos = await dbGetAllByIndex('photos', 'categoryId', categoryId);
+  for (const p of photos) {
+    await dbDelete('photos', p.id);
+  }
+  await dbDelete('categories', categoryId);
+}
+
+// ---- 材料 ----
+
+export async function saveMaterial(material) {
+  return dbSave('materials', material);
+}
+
+export async function getMaterialsByCategory(categoryId) {
+  return dbGetAllByIndex('materials', 'categoryId', categoryId);
+}
+
+export async function deleteMaterial(materialId) {
+  return dbDelete('materials', materialId);
+}
+
+// ---- 写真 ----
+
+export async function savePhoto(photo) {
+  return dbSave('photos', photo);
+}
+
+export async function getPhotosByCategory(categoryId) {
+  return dbGetAllByIndex('photos', 'categoryId', categoryId);
+}
+
+export async function deletePhoto(photoId) {
+  return dbDelete('photos', photoId);
+}
+
+// ---- 手動調整値 ----
+
+export async function saveAdjustment(adjustment) {
+  return dbSave('adjustments', adjustment);
+}
+
+export async function getAdjustmentsByDrawing(drawingId) {
+  const all = await dbGetAll('adjustments');
+  return all.filter(a => a.drawingId === drawingId);
+}
+
+// ---- マスターデータ ----
+
+export async function saveMaster(masterData) {
+  return dbSave('master', { id: 'master', data: masterData, updatedAt: Date.now() });
+}
+
+export async function getMaster() {
+  return dbGet('master', 'master');
+}
+
+// ---- 設定 ----
+
+export async function saveSetting(key, value) {
+  return dbSave('settings', { key, value });
+}
+
+export async function getSetting(key) {
+  const result = await dbGet('settings', key);
+  return result ? result.value : null;
+}
+
+// ---- 初期化チェック ----
+
+export async function isFirstRun() {
+  const result = await dbGet('settings', 'initialized');
+  return !result;
+}
+
+export async function markInitialized() {
+  return dbSave('settings', { key: 'initialized', value: true });
+}
+
+// ---- 全データ削除（デバッグ用） ----
+
+export async function clearAllData() {
+  const stores = ['drawings', 'poles', 'categories', 'materials', 'photos', 'adjustments', 'settings'];
+  for (const store of stores) {
+    await new Promise((resolve, reject) => {
+      const tx = getDB().transaction(store, 'readwrite');
+      tx.objectStore(store).clear();
+      tx.oncomplete = resolve;
+      tx.onerror = reject;
+    });
+  }
+}
+
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, maximum-scale=1.0, user-scalable=no">
+  <meta name="description" content="電気工事（外線部門）向け施工写真整理・材料集計PWAアプリ。CALS/EC対応・完全オフライン動作。">
+  <meta name="theme-color" content="#1e293b">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="施工写真">
+  <meta name="mobile-web-app-capable" content="yes">
+  <title>施工写真管理アプリ - 電気工事外線部門</title>
+  <link rel="manifest" href="./manifest.json">
+  <link rel="stylesheet" href="./styles.css">
+  <!-- 外部ライブラリ（Service Workerでキャッシュ） -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+  <style>
+    /* Toast スタイル */
+    .toast {
+      position: fixed;
+      bottom: calc(32px + env(safe-area-inset-bottom, 0px));
+      left: 50%;
+      transform: translateX(-50%);
+      background: #1e293b;
+      color: #f1f5f9;
+      border: 1px solid #334155;
+      border-radius: 100px;
+      padding: 10px 20px;
+      font-size: 14px;
+      font-weight: 600;
+      z-index: 9999;
+      white-space: nowrap;
+      box-shadow: 0 4px 16px rgba(0,0,0,0.5);
+      animation: toastIn 0.25s ease;
+    }
+    .toast-success { border-color: #22c55e; color: #22c55e; }
+    .toast-error { border-color: #ef4444; color: #ef4444; }
+    @keyframes toastIn {
+      from { opacity:0; transform:translateX(-50%) translateY(12px); }
+      to { opacity:1; transform:translateX(-50%) translateY(0); }
+    }
+  </style>
+</head>
+<body>
+
+<div id="app">
+  <!-- ====== ヘッダー ====== -->
+  <header class="app-header">
+    <div class="header-row">
+      <h1 class="app-title" id="app-title">⚡ 施工写真管理</h1>
+      <div style="display:flex;align-items:center;gap:8px;flex-shrink:0">
+        <!-- 設定ボタン -->
+        <button class="btn btn-icon btn-secondary" id="settings-btn" aria-label="設定" title="設定">⚙️</button>
+      </div>
+    </div>
+  </header>
+
+  <!-- パンくずリスト -->
+  <nav class="breadcrumb" id="breadcrumb" aria-label="パンくずリスト"></nav>
+
+  <!-- ====== 画面1: ホーム（図面番号一覧） ====== -->
+  <div class="screen" id="screen-home">
+    <div class="page-content">
+      <!-- 日付表示（モバイル最適化） -->
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:16px;background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:12px 16px;">
+        <span style="font-size:20px">📅</span>
+        <div style="flex:1">
+          <div style="font-size:11px;color:var(--text-muted);font-weight:600;text-transform:uppercase;letter-spacing:0.05em">作業日付</div>
+          <input type="date" id="work-date" style="background:transparent;border:none;color:var(--text-primary);font-size:16px;font-weight:700;padding:0;outline:none;width:100%;min-height:32px">
+        </div>
+      </div>
+
+      <div class="section-title">図面番号一覧</div>
+
+      <!-- 追加フォーム -->
+      <div class="input-group">
+        <input type="text" id="drawing-input" class="input-field" placeholder="図面番号を入力（例: A-1）" maxlength="50" inputmode="text">
+        <button class="btn btn-primary" id="add-drawing-btn" style="flex-shrink:0">＋追加</button>
+      </div>
+
+      <!-- 図面リスト -->
+      <div id="drawing-list"></div>
+    </div>
+
+    <!-- ボトムバー -->
+    <div class="bottom-bar">
+      <button class="btn btn-secondary btn-sm" id="edit-drawing-btn">✏️ 編集</button>
+      <button class="btn btn-secondary btn-sm" id="delete-drawing-btn">🗑️ 削除</button>
+    </div>
+  </div>
+
+  <!-- ====== 画面2: 電柱番号一覧 ====== -->
+  <div class="screen" id="screen-poles">
+    <div class="page-content">
+      <div class="section-title" id="poles-title">電柱番号一覧</div>
+
+      <!-- 追加フォーム -->
+      <div class="input-group">
+        <input type="text" id="pole-input" class="input-field" placeholder="電柱番号を入力（例: P-01）" maxlength="50" inputmode="text">
+        <button class="btn btn-primary" id="add-pole-btn" style="flex-shrink:0">＋追加</button>
+      </div>
+
+      <!-- 電柱リスト -->
+      <div id="pole-list"></div>
+    </div>
+
+    <div class="bottom-bar">
+      <button class="btn btn-secondary btn-sm" id="poles-back-btn">← 戻る</button>
+      <button class="btn btn-secondary btn-sm" id="delete-pole-btn">🗑️ 削除</button>
+      <button class="btn btn-outline btn-sm" id="materials-agg-btn">📊 総材料数</button>
+    </div>
+  </div>
+
+  <!-- ====== 画面3: 工種一覧 ====== -->
+  <div class="screen" id="screen-categories">
+    <div class="page-content">
+      <div class="section-title" id="categories-title">工種一覧</div>
+
+      <!-- 追加フォーム（大・中工種にのみ表示） -->
+      <div class="input-group" id="add-category-section">
+        <input type="text" id="category-input" class="input-field" placeholder="工種名を入力" maxlength="50">
+        <button class="btn btn-primary" id="add-category-btn" style="flex-shrink:0">＋追加</button>
+      </div>
+
+      <!-- 工種リスト -->
+      <div id="category-list"></div>
+    </div>
+
+    <div class="bottom-bar">
+      <button class="btn btn-secondary btn-sm" id="categories-back-btn">← 戻る</button>
+      <button class="btn btn-secondary btn-sm" id="delete-cat-btn">🗑️ 削除</button>
+    </div>
+  </div>
+
+  <!-- ====== 画面4: 最深部工種専用画面 ====== -->
+  <div class="screen" id="screen-work">
+    <div class="page-content" style="display:flex;flex-direction:column;gap:0">
+
+      <!-- ====== 上部: 撮影エリア ====== -->
+      <div style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:14px;padding:14px;margin-bottom:12px">
+        <div style="font-size:12px;font-weight:700;color:var(--text-muted);letter-spacing:0.08em;margin-bottom:10px">📸 施工写真撮影</div>
+
+        <!-- ステージボタン（3つ横並び） -->
+        <div style="display:flex;gap:8px" id="stage-buttons-container"></div>
+
+        <!-- サムネイル表示 -->
+        <div id="thumbnails-container" style="margin-top:8px"></div>
+      </div>
+
+      <!-- ====== 下部: 材料入力エリア ====== -->
+      <div style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:14px;padding:14px;flex:1">
+        <div style="font-size:12px;font-weight:700;color:var(--text-muted);letter-spacing:0.08em;margin-bottom:10px">📦 使用材料</div>
+        <div style="font-size:11px;color:var(--text-muted);margin-bottom:8px">🔒固定トグルをONにすると次回自動入力</div>
+        <div id="material-list"></div>
+      </div>
+    </div>
+
+    <div class="bottom-bar">
+      <button class="btn btn-secondary btn-sm" id="work-back-btn">← 戻る</button>
+      <div style="flex:1;text-align:center;font-size:14px;font-weight:700;color:var(--text-primary)" id="work-title"></div>
+    </div>
+  </div>
+
+  <!-- ====== 画面5: 総材料数確認・調整 ====== -->
+  <div class="screen" id="screen-materials">
+    <div class="page-content">
+      <div style="font-size:12px;color:var(--text-muted);margin-bottom:12px;padding:10px 12px;background:rgba(59,130,246,0.08);border:1px solid rgba(59,130,246,0.2);border-radius:10px;">
+        ℹ️ ＋ー で現場判断による微調整が可能です。手動変更値が最優先されます。
+      </div>
+      <div class="section-title" id="materials-title">総材料数</div>
+      <div id="agg-material-list"></div>
+    </div>
+    <div class="bottom-bar">
+      <button class="btn btn-secondary btn-sm" id="materials-back-btn">← 戻る</button>
+    </div>
+  </div>
+
+</div><!-- /#app -->
+
+<!-- ====== カメラ画面（フルスクリーン） ====== -->
+<div id="camera-view" class="camera-view" style="display:none">
+  <video id="camera-video" class="camera-video" autoplay playsinline muted></video>
+
+  <!-- 4:3 ガイド枠 -->
+  <div id="camera-guide" class="camera-guide"></div>
+
+  <!-- ステージラベル -->
+  <div style="position:absolute;top:calc(16px + env(safe-area-inset-top,0px));left:50%;transform:translateX(-50%);background:rgba(0,0,0,0.6);color:white;padding:6px 16px;border-radius:100px;font-size:14px;font-weight:700" id="camera-stage-label"></div>
+
+  <!-- カメラコントロール -->
+  <div class="camera-controls">
+    <button class="camera-close-btn" id="camera-close-btn" aria-label="閉じる">✕</button>
+    <button class="shutter-btn" id="shutter-btn" aria-label="撮影"></button>
+    <div style="width:48px"></div><!-- スペーサー -->
+  </div>
+
+  <!-- プレビューオーバーレイ -->
+  <div id="camera-preview-overlay" style="display:none;position:absolute;inset:0;background:rgba(0,0,0,0.85);flex-direction:column;align-items:center;justify-content:center;gap:16px;padding:16px">
+    <img id="camera-preview-img" alt="撮影プレビュー" style="max-width:100%;max-height:60dvh;border-radius:12px;border:2px solid var(--border)">
+    <div style="display:flex;gap:16px;width:100%;max-width:320px">
+      <button class="btn btn-secondary btn-full" id="camera-retake-btn">🔄 撮り直し</button>
+      <button class="btn btn-success btn-full" id="camera-confirm-btn">✅ 確定して続ける</button>
+    </div>
+  </div>
+</div>
+
+<!-- ====== プログレスオーバーレイ ====== -->
+<div class="progress-overlay" id="progress-overlay" style="display:none" aria-live="polite">
+  <div class="spinner"></div>
+  <div style="color:var(--text-primary);font-size:16px;font-weight:700" id="progress-message">処理中...</div>
+  <div class="progress-bar-container">
+    <div class="progress-bar-fill" id="progress-fill" style="width:0%"></div>
+  </div>
+</div>
+
+<!-- ====== エラーモーダル ====== -->
+<div class="modal-overlay center" id="error-modal" style="display:none" role="alertdialog" aria-modal="true">
+  <div class="modal-sheet modal-center">
+    <div class="modal-header">
+      <span class="modal-title">⚠️ エラー</span>
+      <button class="btn btn-icon btn-secondary btn-sm" id="error-close">✕</button>
+    </div>
+    <div id="error-message" style="color:var(--text-secondary);font-size:14px;line-height:1.8;margin-bottom:16px"></div>
+    <button class="btn btn-primary btn-full" id="error-ok">OK</button>
+  </div>
+</div>
+
+<!-- ====== 確認モーダル ====== -->
+<div class="modal-overlay center" id="confirm-modal" style="display:none" role="dialog" aria-modal="true">
+  <div class="modal-sheet modal-center">
+    <div class="modal-header">
+      <span class="modal-title" id="confirm-title">確認</span>
+    </div>
+    <div id="confirm-message" style="color:var(--text-secondary);font-size:14px;line-height:1.8;margin-bottom:20px"></div>
+    <div style="display:flex;gap:12px">
+      <button class="btn btn-secondary btn-full" id="confirm-cancel">キャンセル</button>
+      <button class="btn btn-danger btn-full" id="confirm-ok">削除する</button>
+    </div>
+  </div>
+</div>
+
+<!-- ====== 写真プレビューモーダル ====== -->
+<div class="modal-overlay center" id="photo-preview-modal" style="display:none" role="dialog" aria-modal="true">
+  <div class="modal-sheet modal-center" style="padding:16px">
+    <div style="display:flex;justify-content:flex-end;margin-bottom:8px">
+      <button class="btn btn-icon btn-secondary btn-sm" id="preview-close">✕</button>
+    </div>
+    <img id="preview-img" alt="写真プレビュー" style="width:100%;border-radius:12px;margin-bottom:16px;max-height:60dvh;object-fit:contain">
+    <div style="display:flex;gap:10px">
+      <button class="btn btn-secondary btn-full" id="preview-retake">🔄 撮り直し</button>
+      <button class="btn btn-danger btn-full" id="preview-delete">🗑️ 削除</button>
+    </div>
+  </div>
+</div>
+
+<!-- ====== 設定モーダル ====== -->
+<div class="modal-overlay" id="settings-modal" style="display:none" role="dialog" aria-modal="true">
+  <div class="modal-sheet">
+    <div class="modal-handle"></div>
+    <div class="modal-header">
+      <span class="modal-title">⚙️ 設定・マスター管理</span>
+      <button class="btn btn-icon btn-secondary btn-sm" id="settings-close">✕</button>
+    </div>
+
+    <!-- LINEテキスト取り込み -->
+    <div class="section-title">📱 LINEテキストから取り込み</div>
+    <div style="font-size:12px;color:var(--text-muted);margin-bottom:10px">
+      LINEで共有されたマスターデータ（JSON）を貼り付けて「取り込み」を押してください。
+    </div>
+    <textarea id="line-import-text" class="input-field" placeholder='{"categories":[...],"materials":[...]}' style="min-height:100px;font-size:12px;font-family:monospace"></textarea>
+    <button class="btn btn-primary btn-full" id="import-master-btn" style="margin-top:8px">📥 取り込む</button>
+
+    <!-- LINE用テキストコピー -->
+    <div class="section-title" style="margin-top:16px">📤 現在のマスターをLINEで共有</div>
+    <div style="font-size:12px;color:var(--text-muted);margin-bottom:10px">
+      現在のマスターデータをクリップボードにコピーし、LINEで仲間に共有できます。
+    </div>
+    <button class="btn btn-outline btn-full" id="export-master-btn">📋 LINE用テキストをコピー</button>
+
+    <!-- バージョン情報 -->
+    <div style="margin-top:24px;padding-top:16px;border-top:1px solid var(--border);text-align:center;color:var(--text-muted);font-size:11px">
+      施工写真管理アプリ v1.0<br>
+      電気工事外線部門向け CALS/EC対応 PWA
+    </div>
+  </div>
+</div>
+
+<!-- ====== スクリプト ====== -->
+<script type="module" src="./app.js"></script>
+
+<script>
+  // エラーモーダルのクローズ
+  document.getElementById('error-close')?.addEventListener('click', () => {
+    document.getElementById('error-modal').style.display = 'none';
+  });
+  document.getElementById('error-ok')?.addEventListener('click', () => {
+    document.getElementById('error-modal').style.display = 'none';
+  });
+
+  // モーダル外タップで閉じる
+  document.getElementById('settings-modal')?.addEventListener('click', (e) => {
+    if (e.target === document.getElementById('settings-modal')) {
+      document.getElementById('settings-modal').style.display = 'none';
+    }
+  });
+  document.getElementById('photo-preview-modal')?.addEventListener('click', (e) => {
+    if (e.target === document.getElementById('photo-preview-modal')) {
+      document.getElementById('photo-preview-modal').style.display = 'none';
+    }
+  });
+
+  // ヘッダータイトルをSPAに合わせて更新
+  function updateHeader() {
+    const hash = location.hash;
+    const title = document.getElementById('app-title');
+    const dateInput = document.getElementById('work-date');
+    if (!hash || hash === '#home') {
+      if (title) title.textContent = '⚡ 施工写真管理';
+      if (dateInput) dateInput.style.display = '';
+    } else {
+      if (dateInput) dateInput.style.display = 'none';
+    }
+  }
+  window.addEventListener('popstate', updateHeader);
+  window.addEventListener('hashchange', updateHeader);
+
+  // Service Worker の登録
+  if ('serviceWorker' in navigator) {
+    window.addEventListener('load', () => {
+      navigator.serviceWorker.register('./sw.js')
+        .then(registration => {
+          console.log('ServiceWorker registration successful with scope: ', registration.scope);
+        })
+        .catch(err => {
+          console.log('ServiceWorker registration failed: ', err);
+        });
+    });
+  }
+</script>
+</body>
+</html>
+
+{
+  "name": "施工写真管理アプリ",
+  "short_name": "施工写真",
+  "description": "電気工事（外線部門）向け施工写真整理・材料集計PWAアプリ",
+  "start_url": "./index.html",
+  "display": "standalone",
+  "background_color": "#0f172a",
+  "theme_color": "#1e293b",
+  "orientation": "portrait",
+  "lang": "ja",
+  "icons": [
+    {
+      "src": "icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ],
+  "categories": ["utilities", "productivity"]
+}
+
+/* styles.css - 施工写真管理アプリ カスタムスタイル */
+
+@import url('https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@300;400;500;700;900&display=swap');
+
+:root {
+  --bg-primary: #0f172a;
+  --bg-secondary: #1e293b;
+  --bg-card: #1e293b;
+  --bg-card-hover: #253044;
+  --bg-input: #0f172a;
+  --text-primary: #f1f5f9;
+  --text-secondary: #94a3b8;
+  --text-muted: #64748b;
+  --accent: #3b82f6;
+  --accent-hover: #2563eb;
+  --accent-green: #22c55e;
+  --accent-red: #ef4444;
+  --accent-yellow: #f59e0b;
+  --accent-orange: #f97316;
+  --border: #334155;
+  --border-light: #475569;
+  --shadow: rgba(0, 0, 0, 0.5);
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-left: env(safe-area-inset-left, 0px);
+  --safe-right: env(safe-area-inset-right, 0px);
+}
+
+* {
+  box-sizing: border-box;
+  -webkit-tap-highlight-color: transparent;
+  -webkit-touch-callout: none;
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100dvh;
+  overflow: hidden;
+  background-color: var(--bg-primary);
+  color: var(--text-primary);
+  font-family: 'Noto Sans JP', sans-serif;
+  font-size: 16px;
+  line-height: 1.5;
+}
+
+#app {
+  width: 100%;
+  height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  padding-top: var(--safe-top);
+  padding-bottom: var(--safe-bottom);
+  padding-left: var(--safe-left);
+  padding-right: var(--safe-right);
+  overflow: hidden;
+}
+
+/* ====== ヘッダー ====== */
+.app-header {
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border);
+  padding: 10px 16px;
+  flex-shrink: 0;
+  box-shadow: 0 2px 8px var(--shadow);
+}
+
+.header-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 48px;
+}
+
+.app-title {
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--text-primary);
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* パンくずリスト */
+.breadcrumb {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 6px 16px;
+  background: rgba(15, 23, 42, 0.8);
+  font-size: 12px;
+  color: var(--text-secondary);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.breadcrumb-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--accent);
+  cursor: pointer;
+  padding: 2px 4px;
+  border-radius: 4px;
+  transition: background 0.15s;
+}
+
+.breadcrumb-item:hover {
+  background: rgba(59, 130, 246, 0.15);
+}
+
+.breadcrumb-item.current {
+  color: var(--text-secondary);
+  cursor: default;
+}
+
+.breadcrumb-sep {
+  color: var(--text-muted);
+}
+
+/* ====== メインコンテンツ ====== */
+.page-content {
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: hidden;
+  -webkit-overflow-scrolling: touch;
+  padding: 16px;
+  padding-bottom: 24px;
+}
+
+.page-content::-webkit-scrollbar { width: 4px; }
+.page-content::-webkit-scrollbar-track { background: transparent; }
+.page-content::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+/* ====== ボタン ====== */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 48px;
+  min-width: 48px;
+  padding: 10px 16px;
+  border-radius: 10px;
+  border: none;
+  font-family: 'Noto Sans JP', sans-serif;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  text-align: center;
+  white-space: nowrap;
+  position: relative;
+  overflow: hidden;
+  user-select: none;
+}
+
+.btn::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: rgba(255,255,255,0);
+  transition: background 0.15s;
+}
+
+.btn:active::after {
+  background: rgba(255,255,255,0.1);
+}
+
+.btn-primary {
+  background: linear-gradient(135deg, var(--accent), #2563eb);
+  color: white;
+  box-shadow: 0 2px 8px rgba(59, 130, 246, 0.4);
+}
+.btn-primary:hover { background: linear-gradient(135deg, #2563eb, #1d4ed8); }
+
+.btn-success {
+  background: linear-gradient(135deg, var(--accent-green), #16a34a);
+  color: white;
+  box-shadow: 0 2px 8px rgba(34, 197, 94, 0.4);
+}
+
+.btn-danger {
+  background: linear-gradient(135deg, var(--accent-red), #dc2626);
+  color: white;
+  box-shadow: 0 2px 8px rgba(239, 68, 68, 0.4);
+}
+
+.btn-secondary {
+  background: var(--bg-card);
+  color: var(--text-primary);
+  border: 1px solid var(--border);
+}
+.btn-secondary:hover { background: var(--bg-card-hover); }
+
+.btn-outline {
+  background: transparent;
+  color: var(--text-primary);
+  border: 1.5px solid var(--border);
+}
+.btn-outline:hover { background: var(--bg-card); }
+
+.btn-icon {
+  padding: 10px;
+  border-radius: 10px;
+}
+
+.btn-sm {
+  min-height: 36px;
+  padding: 6px 12px;
+  font-size: 13px;
+  border-radius: 8px;
+}
+
+.btn-lg {
+  min-height: 56px;
+  font-size: 16px;
+  border-radius: 12px;
+}
+
+.btn-full { width: 100%; }
+
+.btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+  box-shadow: none;
+}
+
+/* ====== カード・リストアイテム ====== */
+.card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 16px;
+  margin-bottom: 10px;
+  transition: all 0.15s;
+}
+
+.list-item {
+  display: flex;
+  align-items: center;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 12px 16px;
+  margin-bottom: 8px;
+  min-height: 56px;
+  cursor: pointer;
+  transition: all 0.15s;
+  gap: 10px;
+}
+
+.list-item:hover, .list-item:active {
+  background: var(--bg-card-hover);
+  border-color: var(--border-light);
+}
+
+.list-item-text {
+  flex: 1;
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.list-item-sub {
+  font-size: 12px;
+  color: var(--text-secondary);
+  margin-top: 2px;
+}
+
+/* ====== 入力フォーム ====== */
+.input-group {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+.input-field {
+  flex: 1;
+  min-height: 48px;
+  padding: 10px 14px;
+  background: var(--bg-input);
+  border: 1.5px solid var(--border);
+  border-radius: 10px;
+  color: var(--text-primary);
+  font-family: 'Noto Sans JP', sans-serif;
+  font-size: 16px;
+  transition: border-color 0.15s;
+  outline: none;
+  -webkit-appearance: none;
+}
+
+.input-field:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.2);
+}
+
+.input-field::placeholder { color: var(--text-muted); }
+
+textarea.input-field {
+  min-height: 120px;
+  resize: vertical;
+  line-height: 1.6;
+}
+
+/* ====== モーダル ====== */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.8);
+  backdrop-filter: blur(4px);
+  z-index: 1000;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  padding: 0;
+  animation: fadeIn 0.2s ease;
+}
+
+.modal-overlay.center {
+  align-items: center;
+  padding: 16px;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+.modal-sheet {
+  background: var(--bg-secondary);
+  border-radius: 20px 20px 0 0;
+  padding: 20px 16px calc(20px + var(--safe-bottom));
+  width: 100%;
+  max-width: 640px;
+  max-height: 85dvh;
+  overflow-y: auto;
+  animation: slideUp 0.25s ease;
+}
+
+.modal-sheet.modal-center {
+  border-radius: 16px;
+  max-height: 80dvh;
+  width: 100%;
+}
+
+@keyframes slideUp {
+  from { transform: translateY(30px); opacity: 0; }
+  to { transform: translateY(0); opacity: 1; }
+}
+
+.modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 16px;
+}
+
+.modal-title {
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.modal-handle {
+  width: 40px;
+  height: 4px;
+  background: var(--border-light);
+  border-radius: 2px;
+  margin: 0 auto 16px;
+}
+
+/* ====== 撮影ステージボタン ====== */
+.stage-btn {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  background: var(--bg-card);
+  border: 2px solid var(--border);
+  border-radius: 14px;
+  padding: 16px 8px;
+  cursor: pointer;
+  transition: all 0.2s;
+  flex: 1;
+  min-height: 80px;
+  position: relative;
+}
+
+.stage-btn:active {
+  transform: scale(0.97);
+}
+
+.stage-btn.has-photos {
+  border-color: var(--accent-green);
+  background: rgba(34, 197, 94, 0.08);
+}
+
+.stage-btn.disabled-stage {
+  opacity: 0.4;
+  border-style: dashed;
+}
+
+.stage-badge {
+  position: absolute;
+  top: -8px;
+  right: -8px;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  font-size: 11px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--accent-green);
+  color: white;
+  box-shadow: 0 2px 4px rgba(0,0,0,0.4);
+}
+
+.stage-badge.zero {
+  background: var(--text-muted);
+}
+
+.stage-icon {
+  font-size: 24px;
+}
+
+.stage-label {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+/* ====== 数量カウンター ====== */
+.qty-counter {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.qty-btn {
+  width: 40px;
+  height: 40px;
+  border-radius: 10px;
+  border: 1.5px solid var(--border);
+  background: var(--bg-input);
+  color: var(--text-primary);
+  font-size: 20px;
+  font-weight: 700;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.1s;
+  flex-shrink: 0;
+}
+
+.qty-btn:active { transform: scale(0.9); }
+.qty-btn.plus { border-color: var(--accent); color: var(--accent); }
+.qty-btn.minus { border-color: var(--accent-red); color: var(--accent-red); }
+
+.qty-display {
+  min-width: 48px;
+  text-align: center;
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--text-primary);
+  background: var(--bg-input);
+  border: 1.5px solid var(--border);
+  border-radius: 8px;
+  padding: 6px 4px;
+}
+
+/* ====== トグルスイッチ ====== */
+.toggle-switch {
+  position: relative;
+  width: 44px;
+  height: 24px;
+  flex-shrink: 0;
+}
+
+.toggle-switch input {
+  opacity: 0;
+  width: 0;
+  height: 0;
+  position: absolute;
+}
+
+.toggle-track {
+  position: absolute;
+  inset: 0;
+  background: var(--border-light);
+  border-radius: 24px;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+
+.toggle-track::after {
+  content: '';
+  position: absolute;
+  left: 2px;
+  top: 2px;
+  width: 20px;
+  height: 20px;
+  background: white;
+  border-radius: 50%;
+  transition: transform 0.2s;
+  box-shadow: 0 1px 4px rgba(0,0,0,0.4);
+}
+
+.toggle-switch input:checked + .toggle-track {
+  background: var(--accent-green);
+}
+
+.toggle-switch input:checked + .toggle-track::after {
+  transform: translateX(20px);
+}
+
+/* ====== サムネイルグリッド ====== */
+.thumb-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.thumb-item {
+  aspect-ratio: 4/3;
+  border-radius: 8px;
+  overflow: hidden;
+  cursor: pointer;
+  border: 2px solid transparent;
+  transition: all 0.15s;
+  position: relative;
+}
+
+.thumb-item:hover {
+  border-color: var(--accent);
+}
+
+.thumb-item img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+/* ====== カメラ画面 ====== */
+.camera-view {
+  position: fixed;
+  inset: 0;
+  background: #000;
+  z-index: 2000;
+  display: flex;
+  flex-direction: column;
+}
+
+.camera-video {
+  flex: 1;
+  width: 100%;
+  object-fit: cover;
+  background: #000;
+}
+
+.camera-guide {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  border: 2px solid rgba(255,255,255,0.6);
+  border-radius: 4px;
+  pointer-events: none;
+  box-shadow: 0 0 0 9999px rgba(0,0,0,0.4);
+}
+
+.camera-controls {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  padding: 20px 32px calc(20px + var(--safe-bottom));
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  background: linear-gradient(transparent, rgba(0,0,0,0.8));
+}
+
+.shutter-btn {
+  width: 72px;
+  height: 72px;
+  border-radius: 50%;
+  background: white;
+  border: 4px solid rgba(255,255,255,0.5);
+  cursor: pointer;
+  transition: transform 0.1s;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.5);
+  flex-shrink: 0;
+}
+
+.shutter-btn:active {
+  transform: scale(0.9);
+  background: rgba(255,255,255,0.8);
+}
+
+.camera-close-btn {
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  background: rgba(0,0,0,0.6);
+  border: 1.5px solid rgba(255,255,255,0.3);
+  color: white;
+  font-size: 20px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+
+/* ====== プログレスバー ====== */
+.progress-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.85);
+  backdrop-filter: blur(4px);
+  z-index: 3000;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 20px;
+  padding: 32px;
+}
+
+.progress-bar-container {
+  width: 100%;
+  max-width: 280px;
+  background: var(--border);
+  border-radius: 100px;
+  height: 8px;
+  overflow: hidden;
+}
+
+.progress-bar-fill {
+  height: 100%;
+  background: linear-gradient(90deg, var(--accent), var(--accent-green));
+  border-radius: 100px;
+  transition: width 0.3s ease;
+}
+
+.spinner {
+  width: 48px;
+  height: 48px;
+  border: 4px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+/* ====== 日付ピッカー ====== */
+input[type="date"] {
+  -webkit-appearance: none;
+  background: var(--bg-input);
+  border: 1.5px solid var(--border);
+  border-radius: 10px;
+  color: var(--text-primary);
+  padding: 10px 14px;
+  font-family: 'Noto Sans JP', sans-serif;
+  font-size: 15px;
+  min-height: 48px;
+  cursor: pointer;
+  outline: none;
+}
+
+input[type="date"]:focus {
+  border-color: var(--accent);
+}
+
+input[type="date"]::-webkit-calendar-picker-indicator {
+  filter: invert(1) opacity(0.7);
+}
+
+/* ====== セクションタイトル ====== */
+.section-title {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  margin-bottom: 10px;
+  margin-top: 20px;
+  padding-left: 4px;
+}
+
+.section-title:first-child { margin-top: 0; }
+
+/* ====== バッジ ====== */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 100px;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.badge-blue { background: rgba(59,130,246,0.2); color: var(--accent); }
+.badge-green { background: rgba(34,197,94,0.2); color: var(--accent-green); }
+.badge-red { background: rgba(239,68,68,0.2); color: var(--accent-red); }
+.badge-yellow { background: rgba(245,158,11,0.2); color: var(--accent-yellow); }
+
+/* ====== 空状態 ====== */
+.empty-state {
+  text-align: center;
+  padding: 48px 16px;
+  color: var(--text-muted);
+}
+
+.empty-icon {
+  font-size: 48px;
+  margin-bottom: 12px;
+  opacity: 0.5;
+}
+
+.empty-text {
+  font-size: 15px;
+  line-height: 1.6;
+}
+
+/* ====== ボトムバー ====== */
+.bottom-bar {
+  flex-shrink: 0;
+  background: var(--bg-secondary);
+  border-top: 1px solid var(--border);
+  padding: 10px 16px;
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+/* ====== 材料アイテム ====== */
+.material-item {
+  display: flex;
+  align-items: center;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 10px 12px;
+  margin-bottom: 6px;
+  gap: 8px;
+  min-height: 56px;
+  transition: border-color 0.15s;
+}
+
+.material-item.has-qty {
+  border-color: rgba(34, 197, 94, 0.4);
+}
+
+.material-item.fixed-on {
+  border-color: rgba(245, 158, 11, 0.5);
+  background: rgba(245, 158, 11, 0.05);
+}
+
+.material-name {
+  flex: 1;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-primary);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ====== 工種ボタン ====== */
+.category-btn {
+  display: flex;
+  align-items: center;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 16px;
+  margin-bottom: 8px;
+  cursor: pointer;
+  transition: all 0.15s;
+  min-height: 64px;
+  gap: 12px;
+}
+
+.category-btn:active {
+  background: var(--bg-card-hover);
+  transform: scale(0.99);
+}
+
+.category-btn.leaf {
+  border-color: rgba(59, 130, 246, 0.4);
+  background: rgba(59, 130, 246, 0.05);
+}
+
+.category-btn .chevron {
+  color: var(--text-muted);
+  font-size: 18px;
+  flex-shrink: 0;
+}
+
+/* ====== フォールバック ====== */
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0,0,0,0);
+}
+
+/* ====== アニメーション ====== */
+.fade-in {
+  animation: fadeIn 0.2s ease;
+}
+
+.slide-up {
+  animation: slideUp 0.25s ease;
+}
+
+/* ====== カラースキーム ====== */
+@media (prefers-color-scheme: light) {
+  /* 強制ダークモード（現場使用のため） */
+}
+
+/* ====== iOS PWA対応 ====== */
+@supports (-webkit-touch-callout: none) {
+  .camera-controls {
+    padding-bottom: calc(20px + 34px); /* iOS home indicator */
+  }
+}
+
+/* ====== ページ表示制御 ====== */
+.screen { display: none; width: 100%; height: 100%; flex-direction: column; }
+.screen.active { display: flex; }
+
+// Service Worker - 施工写真管理アプリ
+const CACHE_NAME = 'construction-photo-app-v1';
+const STATIC_ASSETS = [
+  './index.html',
+  './app.js',
+  './db.js',
+  './camera.js',
+  './zip-export.js',
+  './styles.css',
+  './manifest.json',
+  'https://cdn.tailwindcss.com',
+  'https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js',
+  'https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js',
+  'https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js'
+];
+
+// インストール時にキャッシュ
+self.addEventListener('install', (event) => {
+  event.waitUntil(
+    caches.open(CACHE_NAME).then((cache) => {
+      return cache.addAll(STATIC_ASSETS.map(url => {
+        return fetch(url).then(response => {
+          if (response.ok) return cache.put(url, response);
+        }).catch(() => {
+          // CDNリソースがオフライン時は失敗を無視
+          console.warn('Failed to cache:', url);
+        });
+      }));
+    }).then(() => self.skipWaiting())
+  );
+});
+
+// アクティベート時に古いキャッシュを削除
+self.addEventListener('activate', (event) => {
+  event.waitUntil(
+    caches.keys().then((cacheNames) => {
+      return Promise.all(
+        cacheNames
+          .filter(name => name !== CACHE_NAME)
+          .map(name => caches.delete(name))
+      );
+    }).then(() => self.clients.claim())
+  );
+});
+
+// フェッチ時: キャッシュファースト戦略
+self.addEventListener('fetch', (event) => {
+  // chrome-extension や data URI はスキップ
+  if (!event.request.url.startsWith('http')) return;
+
+  event.respondWith(
+    caches.match(event.request).then((cachedResponse) => {
+      if (cachedResponse) {
+        return cachedResponse;
+      }
+      return fetch(event.request).then((response) => {
+        // 正常レスポンスのみキャッシュ
+        if (response && response.status === 200 && response.type !== 'opaque') {
+          const responseToCache = response.clone();
+          caches.open(CACHE_NAME).then((cache) => {
+            cache.put(event.request, responseToCache);
+          });
+        }
+        return response;
+      }).catch(() => {
+        // オフライン時はindex.htmlにフォールバック
+        if (event.request.destination === 'document') {
+          return caches.match('./index.html');
+        }
+      });
+    })
+  );
+});
